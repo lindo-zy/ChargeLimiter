@@ -4,6 +4,17 @@
 
 每个版本按固定结构写：先一段白话说明这版做了什么、为什么，再按 **新增 / 变更 / 修复** 三类列出用户真正会感知到的变化。条目写「是什么 + 有什么用」，不写实现细节；同类改动合并成一条，不罗列 commit。格式参考 [Keep a Changelog](https://keepachangelog.com/) 的分类约定，措辞参考成熟项目的发布说明——写给使用者，不是写给git log。
 
+## 未发布
+
+这一版没有功能变化：仓库从 MonkeyDev Xcode 工程**完整迁移为 Theos roothide 工程**，不再维护 rootless / rootful / TrollStore 出包。安装方式、功能与 roothide 安装约定完全不变，变的只有包的形态。
+
+### 变更
+
+- **发布产物收敛为 roothide 双包**：`ChargeLimiter_<版本>_roothide_ios16_arm64e.deb` 与 `..._ios17_arm64e.deb`（分别用 iOS 16.5 / 17.0 SDK 构建，arm64 + arm64e 双切片）；不再提供 TrollStore `.tipa`、rootful、rootless 包（历史版本仍可在 Releases 页下载）。
+- **构建系统迁移到 Theos**：根目录 `Makefile` + `control` + `layout/` + `build.sh` 取代 `ChargeLimiter.xcodeproj` 与 `scripts/build_packages.sh`；`./build.sh` 一条命令完成双 SDK 构建、签名与全量包检查。
+- **最低部署版本 13.0 → 14.0**：arm64e 切片的工具链下限；roothide 实际运行环境（iOS 15+）不受影响。
+- App 主界面改为纯代码建窗（移除 Main/LaunchScreen storyboard 与 Assets.car，图标改用经典 PNG + `CFBundleIcons`），启动行为与原先一致。
+
 ## v1.17.5 - 2026-10-10
 
 主页那颗电池图标，以前只会显示"正在充电（绿色）"或"使用电池（绿色）"——只要在充电，横杆就是绿的，看不出 ChargeLimiter 到底有没有在干预。这版把图标变成了限流状态的真实反映：**五档高温模拟各自有颜色和动画**，靛蓝=未开启、青=正常、黄=轻度、橙=中度、红=重度，档位越高流动越快；插着线充电时图标变成闪电，一眼能看出"在充电但被限流"。同时修掉了仅限流模式下图标卡在旧状态不刷新的问题。

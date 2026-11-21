@@ -33,11 +33,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DAEMON_MM = ROOT / "ChargeLimiter" / "daemon.mm"
 UTILS_MM = ROOT / "ChargeLimiter" / "utils.mm"
 UTILS_H = ROOT / "ChargeLimiter" / "utils.h"
-TWEAK_M = ROOT / "ChargeLimiter" / "Tweak" / "CLThermalSimTweak.m"
-BUILD_SH = ROOT / "scripts" / "build_packages.sh"
-POSTINST_ROOTFUL = ROOT / "ChargeLimiter" / "Package" / "DEBIAN" / "postinst"
-POSTINST_ROOTLESS = ROOT / "ChargeLimiter" / "Package_rootless" / "DEBIAN" / "postinst"
-POSTINST_ROOTHIDE = ROOT / "ChargeLimiter" / "Package_roothide" / "DEBIAN" / "postinst"
+TWEAK_M = ROOT / "Tweak" / "CLThermalSimTweak.m"
+TWEAK_MAKEFILE = ROOT / "Tweak" / "Makefile"
+POSTINST = ROOT / "layout" / "DEBIAN" / "postinst"
 BATTERY_M = ROOT / "ChargeLimiter" / "UIKit" / "CLBatteryManager.m"
 BATTERY_H = ROOT / "ChargeLimiter" / "UIKit" / "CLBatteryManager.h"
 SETTINGS_M = ROOT / "ChargeLimiter" / "UIKit" / "Controllers" / "CLSettingsViewController.m"
@@ -550,18 +548,11 @@ class AppContractTests(unittest.TestCase):
 class ThermalmonitordReloadContractTests(unittest.TestCase):
     """fix-thermal-limit-stuck-verifying A1：安装后重载 thermalmonitord（三形态）。"""
 
-    def test_rootful_postinst_reloads_thermalmonitord(self):
-        text = POSTINST_ROOTFUL.read_text()
-        self.assertIn("killall thermalmonitord", text)
-
-    def test_rootless_postinst_reloads_thermalmonitord(self):
-        text = POSTINST_ROOTLESS.read_text()
-        self.assertIn("killall thermalmonitord", text)
-
-    def test_roothide_postinst_reloads_thermalmonitord(self):
-        # roothide：killall 不能假定在 PATH（DISABLE_TWEAKS 安装器无注入），经
-        # PATH → jbroot → 真实 rootfs 推导；失败仅放弃重载不阻塞安装
-        text = POSTINST_ROOTHIDE.read_text()
+    def test_postinst_reloads_thermalmonitord(self):
+        # roothide（唯一发布形态）：killall 不能假定在 PATH（DISABLE_TWEAKS
+        # 安装器无注入），经 PATH → jbroot → 真实 rootfs 推导；失败仅放弃
+        # 重载不阻塞安装
+        text = POSTINST.read_text()
         self.assertIn("reload_thermalmonitord() {", text)
         self.assertIn('"$KILLALL_BIN" thermalmonitord 2>/dev/null || true', text)
         self.assertIn("reload_thermalmonitord\n", text)
@@ -572,13 +563,12 @@ class PackagingAndStringsContractTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.build = BUILD_SH.read_text()
+        cls.tweak_makefile = TWEAK_MAKEFILE.read_text()
         cls.en = STRINGS_EN.read_text()
         cls.zh = STRINGS_ZH.read_text()
 
     def test_tweak_links_iokit(self):
-        body = function_body(self.build, "build_tweak_dylib() {")
-        self.assertIn("IOKit.tbd", body)
+        self.assertIn("IOKit.tbd", self.tweak_makefile)
 
     def test_strings_synced(self):
         # limit-only-idle-thermal-level：「限流档位」行名与「已插电 · 限流生效中 /

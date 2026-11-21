@@ -18,7 +18,7 @@ ChargeLimiter（下文简称 CL）是面向 iPhone 的充电控制工具（macOS
 ## 介绍
 
 * CL 适用于长时间过充场景下的电池健康度保护：长期插电办公、整夜充电、充电时希望控制温度。
-* 支持巨魔 TrollStore（`.tipa`）、有根越狱 rootful（`.deb`）、无根越狱 rootless（`.deb`）、roothide（`.deb`，原生构建）。最低系统要求 iOS 13.0；重点验证环境为 iOS 15–17。
+* 支持 roothide 越狱（`.deb`，Theos 原生构建，ios16 / ios17 双 SDK 包），发布形态为 roothide-only。最低部署 iOS 14.0（roothide 实际运行于 iOS 15–17）；自 v1.17.5 工程迁移起不再随仓库出 TrollStore `.tipa` / rootful / rootless 包，但代码仍保留各环境的运行时识别。
 * 本仓库是 [lich4/ChargeLimiter](https://github.com/lich4/ChargeLimiter) 的社区分支（fork），在上游 v1.7 系的基础上持续演进：原生 UIKit 界面、智能停充、插电保持、满充计划、限流原子配置、策略诊断、relaxin/roothide 原生适配等。版本历史见 [CHANGELOG.md](CHANGELOG.md)。
 * CL 是开放式项目，欢迎提交代码与建议。CL 承诺永久免费且无广告；但因为使用 CL 导致系统或硬件方面的影响（或认为会有影响的），作者不负任何责任，用户使用 CL 即为默认同意本条款。如果你的软硬件环境不兼容，则不建议使用。
 
@@ -395,46 +395,36 @@ curl http://127.0.0.1:1230 -d '{"api":"get_conf","key":"enable"}' -H "content-ty
 
 ## 安装产物与下载
 
-构建脚本会生成四类发布产物（写入 `out/`）：
+构建脚本产出两类 roothide 发布包（写入 `out/`）：
 
 | 环境 | 产物 | 包架构 |
 | --- | --- | --- |
-| TrollStore | `ChargeLimiter_<版本>_TrollStore.tipa` | arm64 |
-| 越狱 rootful | `ChargeLimiter_<版本>_rootful_arm.deb` | iphoneos-arm |
-| 越狱 rootless | `ChargeLimiter_<版本>_rootless_arm64.deb` | iphoneos-arm64 |
-| 越狱 roothide | `ChargeLimiter_<版本>_roothide_arm64e.deb` | iphoneos-arm64e（原生构建） |
+| 越狱 roothide（iOS 16.5 SDK 构建） | `ChargeLimiter_<版本>_roothide_ios16_arm64e.deb` | iphoneos-arm64e |
+| 越狱 roothide（iOS 17.0 SDK 构建） | `ChargeLimiter_<版本>_roothide_ios17_arm64e.deb` | iphoneos-arm64e |
 
 * 下载：<https://github.com/tunecc/ChargeLimiter/releases>
-* 巨魔环境安装新版前请先卸载旧版
-* roothide 为原生构建（scheme `ChargeLimiter roothide` + `Package_roothide` 模板，无 `/var/jb` 前缀），自 v1.15.0 起适配 relaxin；详细打包说明见 [docs/roothide-packaging.md](docs/roothide-packaging.md)
+* 历史的 tipa / rootful / rootless 产物自 v1.17.5 工程迁移起不再发布，旧版本可在 Releases 页下载
+* roothide 由 Theos 原生构建（`THEOS_PACKAGE_SCHEME=roothide`，无 `/var/jb` 前缀），自 v1.15.0 起适配 relaxin；详细打包说明见 [构建安装包.md](构建安装包.md)
 
 ## 构建与打包
 
 详细说明见 [构建安装包.md](构建安装包.md)。
 
-快速命令：
+快速命令（Theos roothide 工程）：
 
 ```bash
-./scripts/build_packages.sh                # 构建全部四类产物
-./scripts/build_packages.sh --skip-roothide  # 本机无 roothide 库时跳过
-./scripts/build_packages.sh 1.15.3         # 手动指定版本号（默认取自工程 MARKETING_VERSION）
+./build.sh                    # ios16 + ios17 双 SDK 构建 + 包检查，输出到 out/
+./build.sh --target ios16     # 单目标构建
+THEOS=/path/to/theos-roothide ./build.sh   # 指定 Theos 路径
 ```
 
 单独验证编译：
 
 ```bash
-xcodebuild -project ChargeLimiter.xcodeproj -scheme "ChargeLimiter" -destination "generic/platform=iOS" -configuration Release -derivedDataPath build_rootful CODE_SIGNING_ALLOWED=NO ARCHS=arm64
+THEOS=/Users/xiao/dev/theos-roothide make THEOS_PACKAGE_SCHEME=roothide TARGET="iphone:clang:16.5:14.0"
 ```
 
-```bash
-xcodebuild -project ChargeLimiter.xcodeproj -scheme "ChargeLimiter rootless" -destination "generic/platform=iOS" -configuration Release -derivedDataPath build_rootless CODE_SIGNING_ALLOWED=NO ARCHS=arm64
-```
-
-```bash
-xcodebuild -project ChargeLimiter.xcodeproj -scheme "ChargeLimiter roothide" -destination "generic/platform=iOS" -configuration Release -derivedDataPath build_roothide CODE_SIGNING_ALLOWED=NO ARCHS=arm64 THEOS_PACKAGE_SCHEME=roothide
-```
-
-推送到 `v*` 标签时，GitHub Actions 会自动构建四类产物并发布 Release。
+推送到 `v*` 标签时，GitHub Actions 会自动构建 roothide 双包并发布 Release。
 
 ## 相关文档
 
@@ -499,7 +489,7 @@ ChargeLimiter (CL) is a charging-control tool for iPhone, inspired by AlDente fo
 ## What is CL
 
 * CL protects battery health in always-plugged-in scenarios: a phone connected to power all day, charged overnight, or that needs temperature control while charging.
-* Supported environments: TrollStore (`.tipa`), rootful jailbreak (`.deb`), rootless jailbreak (`.deb`), and roothide (`.deb`, native build). Minimum iOS version: 13.0; key validated environments are iOS 15–17.
+* Supported environment: roothide jailbreak (`.deb`, native Theos build, dual ios16/ios17 SDK packages) — releases are roothide-only. Minimum deployment target: iOS 14.0 (roothide actually runs on iOS 15–17); since the v1.17.5 project migration, TrollStore `.tipa` / rootful / rootless artifacts are no longer shipped, though runtime detection for those environments remains.
 * This repository is a community fork of [lich4/ChargeLimiter](https://github.com/lich4/ChargeLimiter), continuously evolved on top of the upstream v1.7 line: native UIKit UI, smart charge inhibit, plug-in hold, full-charge schedule, atomic limit-inflow config, policy diagnostics, native roothide/relaxin support, and more. See [CHANGELOG.md](CHANGELOG.md) for the version history.
 * CL is an open project — contributions and suggestions are welcome. CL is and always will be free and ad-free; however, the author is not responsible for any impact (real or perceived) on your system or hardware caused by using CL. By using CL you accept this terms. If your hardware/software environment is incompatible, please do not use it.
 
@@ -876,46 +866,36 @@ A few internal/bookkeeping keys with no UI exposure are omitted here: `temp_mode
 
 ## Packages and download
 
-The build script produces four packages (written to `out/`):
+The build script produces two roothide release packages (written to `out/`):
 
 | Environment | Artifact | Architecture |
 | --- | --- | --- |
-| TrollStore | `ChargeLimiter_<version>_TrollStore.tipa` | arm64 |
-| Rootful jailbreak | `ChargeLimiter_<version>_rootful_arm.deb` | iphoneos-arm |
-| Rootless jailbreak | `ChargeLimiter_<version>_rootless_arm64.deb` | iphoneos-arm64 |
-| roothide jailbreak | `ChargeLimiter_<version>_roothide_arm64e.deb` | iphoneos-arm64e (native build) |
+| roothide jailbreak (iOS 16.5 SDK build) | `ChargeLimiter_<version>_roothide_ios16_arm64e.deb` | iphoneos-arm64e |
+| roothide jailbreak (iOS 17.0 SDK build) | `ChargeLimiter_<version>_roothide_ios17_arm64e.deb` | iphoneos-arm64e |
 
 * Download: <https://github.com/tunecc/ChargeLimiter/releases>
-* On TrollStore, uninstall the old version before installing a newer one
-* roothide is built natively (scheme `ChargeLimiter roothide` + the `Package_roothide` template, no `/var/jb` prefix) and supports relaxin since v1.15.0; see [docs/roothide-packaging.md](docs/roothide-packaging.md)
+* The legacy tipa / rootful / rootless artifacts are no longer shipped since the v1.17.5 project migration; older versions remain on the Releases page
+* roothide is built natively with Theos (`THEOS_PACKAGE_SCHEME=roothide`, no `/var/jb` prefix) and supports relaxin since v1.15.0; see [构建安装包.md](构建安装包.md) for details
 
 ## Building
 
 See [构建安装包.md](构建安装包.md) for details.
 
-Quick commands:
+Quick commands (Theos roothide project):
 
 ```bash
-./scripts/build_packages.sh                # build all four packages
-./scripts/build_packages.sh --skip-roothide  # skip roothide when its libs are missing
-./scripts/build_packages.sh 1.15.3         # override the version (defaults to MARKETING_VERSION)
+./build.sh                    # dual-SDK build (ios16 + ios17) with package checks, output to out/
+./build.sh --target ios16     # single-target build
+THEOS=/path/to/theos-roothide ./build.sh   # explicit Theos path
 ```
 
 Compile-only verification:
 
 ```bash
-xcodebuild -project ChargeLimiter.xcodeproj -scheme "ChargeLimiter" -destination "generic/platform=iOS" -configuration Release -derivedDataPath build_rootful CODE_SIGNING_ALLOWED=NO ARCHS=arm64
+THEOS=/Users/xiao/dev/theos-roothide make THEOS_PACKAGE_SCHEME=roothide TARGET="iphone:clang:16.5:14.0"
 ```
 
-```bash
-xcodebuild -project ChargeLimiter.xcodeproj -scheme "ChargeLimiter rootless" -destination "generic/platform=iOS" -configuration Release -derivedDataPath build_rootless CODE_SIGNING_ALLOWED=NO ARCHS=arm64
-```
-
-```bash
-xcodebuild -project ChargeLimiter.xcodeproj -scheme "ChargeLimiter roothide" -destination "generic/platform=iOS" -configuration Release -derivedDataPath build_roothide CODE_SIGNING_ALLOWED=NO ARCHS=arm64 THEOS_PACKAGE_SCHEME=roothide
-```
-
-Pushing a `v*` tag makes GitHub Actions build all four packages and publish a Release automatically.
+Pushing a `v*` tag makes GitHub Actions build the roothide dual packages and publish a Release automatically.
 
 ## Related documents
 

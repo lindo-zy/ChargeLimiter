@@ -47,6 +47,19 @@ static BOOL isDarkMode() {
 static UIView* _mainWnd = nil;
 static AppDelegate* _app = nil;
 - (void)scene:(UIScene*)scene willConnectToSession:(UISceneSession*)session options:(UISceneConnectionOptions*)connectionOptions API_AVAILABLE(ios(13.0)) {
+    // Theos 工程无 Main.storyboard：scene 接入时用代码建窗，AppDelegate 自身
+    // 作为初始 rootViewController（与原 storyboard 行为等价，viewDidAppear
+    // 内再切换到 CLMainViewController）。
+    if (@available(iOS 13.0, *)) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene* windowScene = (UIWindowScene*)scene;
+            UIWindow* window = [[UIWindow alloc] initWithFrame:windowScene.coordinateSpace.bounds];
+            window.windowScene = windowScene;
+            window.rootViewController = self;
+            self.window = window;
+            [window makeKeyAndVisible];
+        }
+    }
     if (connectionOptions.URLContexts != nil) {
         [self scene:scene openURLContexts:connectionOptions.URLContexts];
     }
@@ -82,6 +95,14 @@ static AppDelegate* _app = nil;
 }
 - (BOOL)application:(UIApplication*)application didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey,id>*)launchOptions {
     if (g_wind_type == 0) {
+        // 无 storyboard：正常路径的窗口由 scene:willConnectToSession: 代码创建；
+        // 这里兜底 iOS 12 等无 scene 的启动路径。
+        if (self.window == nil) {
+            UIWindow* window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
+            window.rootViewController = self;
+            self.window = window;
+            [window makeKeyAndVisible];
+        }
         _mainWnd = self.window;
     } else if (g_wind_type == 1) { // from TrollSpeed
         self.window = [[HUDMainWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];

@@ -11,9 +11,7 @@ SETTINGS_M = ROOT / "ChargeLimiter" / "UIKit" / "Controllers" / "CLSettingsViewC
 STRINGS_EN = ROOT / "ChargeLimiter" / "en.lproj" / "Localizable.strings"
 STRINGS_ZH = ROOT / "ChargeLimiter" / "zh-Hans.lproj" / "Localizable.strings"
 PRERM_PATHS = [
-    ROOT / "ChargeLimiter" / "Package" / "DEBIAN" / "prerm",
-    ROOT / "ChargeLimiter" / "Package_rootless" / "DEBIAN" / "prerm",
-    ROOT / "ChargeLimiter" / "Package_roothide" / "DEBIAN" / "prerm",
+    ROOT / "layout" / "DEBIAN" / "prerm",
 ]
 UTILS_MM = ROOT / "ChargeLimiter" / "utils.mm"
 UTILS_H = ROOT / "ChargeLimiter" / "utils.h"

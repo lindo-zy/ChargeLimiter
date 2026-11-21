@@ -1,20 +1,51 @@
-export THEOS = /opt/theos
-export THEOS_DEVICE_IP=127.0.0.1
-export THEOS_DEVICE_PORT=22
-ARCHS=arm64
+APPLICATION_NAME = ChargeLimiter
 
-_THEOS_PLATFORM_DPKG_DEB=dpkg-deb
-THEOS_PLATFORM_DEB_COMPRESSION_TYPE=gzip
-THEOS_PLATFORM_DEB_COMPRESSION_LEVEL=9
+# 主 App（UIKit 原生界面，入口 main 在 ui.mm；CLTestApp.m 仅模拟器测试用，不编译）。
+ChargeLimiter_FILES = ui.mm \
+	utils.mm \
+	CLLocalization.mm \
+	CLSimpleHTTPServer.m \
+	UIKit/CLAPIClient.m \
+	UIKit/CLBatteryManager.m \
+	UIKit/CLDiagnosticCollector.m \
+	UIKit/Controllers/CLAdvancedSettingsViewController.m \
+	UIKit/Controllers/CLBatteryCompatibilityTestViewController.m \
+	UIKit/Controllers/CLHelpViewController.m \
+	UIKit/Controllers/CLMainViewController.m \
+	UIKit/Controllers/CLSettingsViewController.m
+
+ChargeLimiter_FRAMEWORKS = UIKit Foundation CoreGraphics CFNetwork CoreServices JavaScriptCore UserNotifications
+
+# 私有框架走仓库 tbd 存根（与旧 Xcode Frameworks phase 一致）；
+# libMobileGestalt/sqlite3/z 由 SDK 自带 tbd 提供。
+ChargeLimiter_LDFLAGS = $(THEOS_PROJECT_DIR)/tbd/BackBoardServices.tbd \
+	$(THEOS_PROJECT_DIR)/tbd/GraphicsServices.tbd \
+	$(THEOS_PROJECT_DIR)/tbd/IOKit.tbd \
+	-lMobileGestalt
+
+# jbroot() 由静态 libroot.a 提供（roothide scheme 下 Theos 不自动链 -lroot，
+# 与旧 Xcode roothide 配置一致：libroot.a 打进二进制，运行期自解析 jbroot）。
+ChargeLimiter_LDFLAGS += -L$(THEOS)/vendor/lib -lroot
+
+# CLDiagnosticCollector 等按包方案分支的宏（THEOS_PACKAGE_SCHEME_ROOTHIDE=1
+# 由 Theos 按 scheme 自动定义）。-I 模拟 Xcode headermap：源码里按裸文件名
+# 跨目录 import 根目录与 UIKit/ 的头文件。
+ChargeLimiter_CFLAGS = -fobjc-arc -DCL_PACKAGE_ROOTHIDE=1 \
+	-I$(THEOS_PROJECT_DIR)/ChargeLimiter \
+	-I$(THEOS_PROJECT_DIR)/ChargeLimiter/UIKit \
+	-Wno-module-import-in-extern-c
+
+ChargeLimiter_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements/app.roothide.plist
+
+ChargeLimiter_RESOURCE_FILES = Info.plist \
+	lang.json \
+	en.lproj \
+	zh-Hans.lproj \
+	AppIcon60x60@2x.png \
+	AppIcon60x60@3x.png \
+	AppIcon76x76@2x~ipad.png
+
+ChargeLimiter_INSTALL_PATH = /Applications
 
 include $(THEOS)/makefiles/common.mk
-
-TOOL_NAME = ChargeLimiter
-${TOOL_NAME}_FILES = main.mm utils.mm
-${TOOL_NAME}_CODESIGN_FLAGS = -SChargeLimiter.entitlements
-${TOOL_NAME}_CFLAGS = -fobjc-arc -std=c++11 -Wno-objc-property-no-attribute -F/opt/framework
-${TOOL_NAME}_LDFLAGS = -L/opt/theos/vendor/lib -lroot -lz BackBoardServices.tbd -lz IOKit.tbd -lz GraphicsServices.tbd 
-${TOOL_NAME}_LDFLAGS += -F/opt/framework -framework GCDWebServers -framework CoreServices -lxml2
-${TOOL_NAME}_INSTALL_PATH = /Applications/ChargeLimiter.app
-
-include $(THEOS_MAKE_PATH)/tool.mk
+include $(THEOS_MAKE_PATH)/application.mk
