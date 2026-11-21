@@ -22,6 +22,9 @@ ChargeLimiterDaemon_CFLAGS = -fobjc-arc \
 	-I$(THEOS_PROJECT_DIR)/ChargeLimiter/UIKit \
 	-Wno-module-import-in-extern-c
 
+# 同 ChargeLimiter/Makefile：CI 的 Xcode 16.x clang 默认 gnu++98，需显式标准。
+ChargeLimiterDaemon_OBJCCFLAGS = -std=gnu++14
+
 ChargeLimiterDaemon_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements/daemon.roothide.plist
 
 ChargeLimiterDaemon_INSTALL_PATH = /Applications/ChargeLimiter.app

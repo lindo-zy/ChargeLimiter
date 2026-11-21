@@ -35,6 +35,12 @@ ChargeLimiter_CFLAGS = -fobjc-arc -DCL_PACKAGE_ROOTHIDE=1 \
 	-I$(THEOS_PROJECT_DIR)/ChargeLimiter/UIKit \
 	-Wno-module-import-in-extern-c
 
+# .mm 里的 C++ lambda（BKSHIDEvent/CFNotificationCenter 回调）需要显式 C++
+# 标准：Xcode 16.x 的 clang 默认仍是 gnu++98（lambda 直接语法报错），Xcode 26
+# 默认 >=gnu++17 所以本地踩不到。原 Xcode 工程即 CLANG_CXX_LANGUAGE_STANDARD
+# = c++14；OBJCCFLAGS 只作用于 .mm 编译，不影响 .m 的 C 模式。
+ChargeLimiter_OBJCCFLAGS = -std=gnu++14
+
 ChargeLimiter_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements/app.roothide.plist
 
 ChargeLimiter_RESOURCE_FILES = Info.plist \
