@@ -533,6 +533,10 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 
 - (void)refresh {
     if (![self canShow]) { [self stop]; return; }
+    // 回显状态机的 1s 兜底驱动：daemon 广播（policystate notify）丢失或 daemon
+    // 已死时，pending 超时判定与按钮还原不依赖 notify 到达（防按钮卡在「已发送」）
+    [self resolvePendingEcho];
+    [self refreshCardContent];
     if (self.sampling) return;
     NSTimeInterval probeTime = NSProcessInfo.processInfo.systemUptime;
     if (probeTime - self.lastProbeTime < 0.8) return;
