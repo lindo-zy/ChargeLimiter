@@ -11,6 +11,8 @@
 #     不再产出 TrollStore tipa / rootful / rootless。
 #   - 产物统一 packages/<label>/（ios16 / ios17，与 Metis 同款），命名
 #     com.chargelimiter.mod_<ver>_<label>_iphoneos-arm64e.deb——版本在文件名里区分。
+#   - 版本每次构建自动递增（PATCH+1，>10 进 MINOR；MINOR 不自动进位；--version 可覆盖），
+#     全部目标成功后写回 control + Info.plist，失败保持原版本。
 #   - 本地目录只保留最新一次构建：每次构建前清空对应 label 目录的旧 deb，
 #     不保留历史版本（历史版本走 GitHub Releases）。
 #   - 版本单一来源 = control；Info.plist 短版本必须与之一致，不一致直接报错。
@@ -49,11 +51,24 @@ if [[ ! "$CONTROL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
+# 版本自动递增（TypeX 的 PATCH 溢出规则）：PATCH +1，>10 进 MINOR。
+# MINOR 不自动进位——本工程 MINOR 可能 ≥10（1.17.x），套用 MINOR 满 10 进 MAJOR
+# 会每次构建都跳大版本；跨 MINOR/MAJOR 用 --version 显式指定。
+bump_version() {
+    local major="${1%%.*}" rest="${1#*.}"
+    local minor="${rest%%.*}" patch="${rest##*.}"
+    patch=$((10#$patch + 1))
+    if (( patch > 10 )); then patch=0; minor=$((10#$minor + 1)); fi
+    echo "${major}.${minor}.${patch}"
+}
+
 usage() {
     cat >&2 <<'EOF'
-usage: ./build.sh [--target ios16|ios17|all]
-  --target   构建目标，默认 all（ios16 = iPhoneOS16.5.sdk，ios17 = iPhoneOS17.0.sdk，
-             部署目标统一 13.0，仅 SDK 不同）。
+usage: ./build.sh [--target ios16|ios17|all] [--version MAJOR.MINOR.PATCH]
+  --target   构建目标，默认 all（ios16 = iPhoneOS16.5.sdk，ios17 = iPhoneOS17.0.sdk）。
+  --version  可选覆盖（MAJOR.MINOR.PATCH）。缺省自动递增：PATCH +1（>10 进 MINOR，
+             MINOR 不自动进 MAJOR）；全部目标构建成功后才写回 control 与 Info.plist，
+             失败不写（保持原版本）。
 环境变量：
   THEOS=<dir>                 覆盖 Theos 路径（默认 /Users/xiao/dev/theos-roothide）。
 EOF
@@ -61,9 +76,11 @@ EOF
 }
 
 BUILD_TARGET="all"
+BUILD_VERSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --target) BUILD_TARGET="${2:-}"; shift 2 ;;
+        --version) BUILD_VERSION="${2:-}"; shift 2 ;;
         --help|-h) usage ;;
         *) echo "error: unknown argument: $1" >&2; usage ;;
     esac
@@ -72,6 +89,11 @@ case "$BUILD_TARGET" in
     ios16|ios17|all) ;;
     *) echo "error: invalid --target: $BUILD_TARGET" >&2; usage ;;
 esac
+if [[ -n "$BUILD_VERSION" ]] && ! [[ "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "error: version must be MAJOR.MINOR.PATCH: $BUILD_VERSION" >&2
+    exit 1
+fi
+VERSION_TO_BUILD="${BUILD_VERSION:-$(bump_version "$CONTROL_VERSION")}"
 
 sdk_for_label() {
     case "$1" in
@@ -87,14 +109,43 @@ if [[ "$PLIST_VERSION" != "$CONTROL_VERSION" ]]; then
     exit 1
 fi
 
-# ---- 进程级锁 ----
+# ---- 进程级锁 + 版本写回（Metis 同款：全部目标构建成功才写，失败保持原版本） ----
 mkdir -p "$ROOT_DIR/packages"
 LOCK_DIR="$ROOT_DIR/packages/.build-lock"
 if [[ -e "$LOCK_DIR" ]] || ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "error: another build is in progress (lock: $LOCK_DIR)" >&2
     exit 1
 fi
-trap 'rm -rf "$LOCK_DIR"' EXIT
+
+persist_version() {
+    [[ "$CONTROL_VERSION" == "$VERSION_TO_BUILD" ]] && return 0
+    local control_tmp
+    control_tmp="$(mktemp "$ROOT_DIR/control.tmp.XXXXXX")" || return 1
+    awk -v next_version="$VERSION_TO_BUILD" '
+        BEGIN { updated = 0 }
+        /^Version:/ { print "Version: " next_version; updated = 1; next }
+        { print }
+        END { if (!updated) exit 1 }
+    ' "$CONTROL_FILE" > "$control_tmp" || { rm -f "$control_tmp"; return 1; }
+    mv "$control_tmp" "$CONTROL_FILE" || return 1
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString '"$VERSION_TO_BUILD" "$INFO_PLIST" || return 1
+    echo "==> version: ${CONTROL_VERSION} -> ${VERSION_TO_BUILD} (control + Info.plist)"
+}
+
+finalize() {
+    local rc=$?
+    trap - EXIT
+    if [[ $rc -eq 0 ]]; then
+        # 构建链全部成功才落版本号；任何失败保持 control/Info.plist 原值。
+        if ! persist_version; then
+            echo "error: failed to persist version" >&2
+            rc=1
+        fi
+    fi
+    rm -rf "$LOCK_DIR"
+    exit "$rc"
+}
+trap finalize EXIT
 
 check_deb() {
     local deb="$1"
@@ -109,7 +160,7 @@ check_deb() {
         for field in Package Version Architecture; do
             case "$field" in
                 Package) expected="$PACKAGE_ID" ;;
-                Version) expected="$CONTROL_VERSION" ;;
+                Version) expected="$VERSION_TO_BUILD" ;;
                 Architecture) expected="iphoneos-arm64e" ;;
             esac
             actual="$(dpkg-deb -f "$deb" "$field")"
@@ -239,7 +290,7 @@ build_one() {
         exit 1
     fi
 
-    echo "==> [$BUILD_TARGET mode] Building $label with iPhoneOS${sdk_version}.sdk (deployment ${DEPLOYMENT_TARGET})"
+    echo "==> Building $label (v$VERSION_TO_BUILD) with iPhoneOS${sdk_version}.sdk (deployment ${DEPLOYMENT_TARGET})"
 
     mkdir -p "$ROOT_DIR/packages"
     find "$ROOT_DIR/packages" -maxdepth 1 -type f -name '*.deb' -delete 2>/dev/null || true
@@ -249,7 +300,7 @@ build_one() {
         cd "$ROOT_DIR"
         THEOS_PACKAGE_SCHEME=roothide \
             TARGET="iphone:clang:${sdk_version}:${DEPLOYMENT_TARGET}" \
-            "$MAKE_BIN" package FINALPACKAGE=1 PACKAGE_VERSION="$CONTROL_VERSION"
+            "$MAKE_BIN" package FINALPACKAGE=1 PACKAGE_VERSION="$VERSION_TO_BUILD"
     )
 
     local package_path
@@ -262,7 +313,7 @@ build_one() {
     # 产物落 packages/<label>/（Metis 同款）：版本在文件名里区分；
     # 先清空该 label 目录旧 deb——本地只保留最新一次构建
     local output_dir="$ROOT_DIR/packages/$label"
-    local output_path="$output_dir/${PACKAGE_ID}_${CONTROL_VERSION}_${label}_iphoneos-arm64e.deb"
+    local output_path="$output_dir/${PACKAGE_ID}_${VERSION_TO_BUILD}_${label}_iphoneos-arm64e.deb"
     mkdir -p "$output_dir"
     find "$output_dir" -maxdepth 1 -type f -name '*.deb' -delete 2>/dev/null || true
     mv "$package_path" "$output_path"
@@ -276,4 +327,4 @@ case "$BUILD_TARGET" in
     all) build_one ios16; build_one ios17 ;;
 esac
 
-echo "==> verify build complete: ${CONTROL_VERSION}"
+echo "==> build complete: ${VERSION_TO_BUILD}"
