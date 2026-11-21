@@ -5438,6 +5438,146 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 
 #pragma mark - 主控制器
 
+@interface CLTempFullChargeRow : UIStackView
+@property (nonatomic, strong) UIImageView *boltIcon;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *detailLabel;
+@property (nonatomic, strong) UIButton *actionButton;
+@property (nonatomic, strong) UIStackView *progressSection;
+@property (nonatomic, strong) UIProgressView *progressBar;
+@property (nonatomic, strong) UILabel *currentLabel;
+- (void)updateWithManager:(CLBatteryManager *)manager limit:(NSInteger)limit;
+@end
+
+@implementation CLTempFullChargeRow
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    self.axis = UILayoutConstraintAxisVertical;
+    self.spacing = 6;
+    self.layoutMarginsRelativeArrangement = YES;
+    self.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(10, kCLCardIconLeading, 10, kCLCardIconLeading);
+
+    const CGFloat iconSize = 30;
+    const CGFloat iconGap = kCLCardTitleLeading - kCLCardIconLeading - iconSize;
+    self.boltIcon = [[UIImageView alloc] initWithImage:CLSymbolImage(@"bolt.fill",
+        [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold])];
+    self.boltIcon.contentMode = UIViewContentModeCenter;
+    self.boltIcon.layer.cornerRadius = 8;
+    self.boltIcon.clipsToBounds = YES;
+
+    self.titleLabel = [[UILabel alloc] init];
+    self.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    self.titleLabel.adjustsFontForContentSizeCategory = YES;
+    self.titleLabel.numberOfLines = 0;
+
+    self.detailLabel = [[UILabel alloc] init];
+    self.detailLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    self.detailLabel.adjustsFontForContentSizeCategory = YES;
+    self.detailLabel.numberOfLines = 0;
+
+    UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[self.titleLabel, self.detailLabel]];
+    labels.axis = UILayoutConstraintAxisVertical;
+    labels.spacing = 3;
+
+    self.actionButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.actionButton.titleLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleSubheadline]
+        scaledFontForFont:[UIFont systemFontOfSize:14 weight:UIFontWeightSemibold]];
+    self.actionButton.titleLabel.adjustsFontForContentSizeCategory = YES;
+    self.actionButton.contentEdgeInsets = UIEdgeInsetsMake(6, 12, 6, 12);
+    self.actionButton.layer.cornerRadius = 13;
+    [self.actionButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [self.actionButton setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+    UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[self.boltIcon, labels, self.actionButton]];
+    header.alignment = UIStackViewAlignmentCenter;
+    header.spacing = 10;
+    [header setCustomSpacing:iconGap afterView:self.boltIcon];
+    [self addArrangedSubview:header];
+
+    self.progressBar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.progressBar.progressTintColor = [UIColor systemGreenColor];
+    self.progressBar.trackTintColor = [UIColor systemGray5Color];
+    // The visible caption already describes the current progress.
+    self.progressBar.isAccessibilityElement = NO;
+
+    self.currentLabel = [[UILabel alloc] init];
+    UILabel *targetLabel = [[UILabel alloc] init];
+    for (UILabel *label in @[self.currentLabel, targetLabel]) {
+        label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+        label.adjustsFontForContentSizeCategory = YES;
+        label.textColor = [UIColor secondaryLabelColor];
+        label.numberOfLines = 0;
+    }
+    targetLabel.text = [NSString stringWithFormat:CLL(@"目标 %ld%%"), 100L];
+    targetLabel.textAlignment = NSTextAlignmentRight;
+    UIStackView *captions = [[UIStackView alloc] initWithArrangedSubviews:@[self.currentLabel, targetLabel]];
+    captions.distribution = UIStackViewDistributionFillEqually;
+    captions.alignment = UIStackViewAlignmentFirstBaseline;
+    captions.spacing = 8;
+
+    self.progressSection = [[UIStackView alloc] initWithArrangedSubviews:@[self.progressBar, captions]];
+    self.progressSection.axis = UILayoutConstraintAxisVertical;
+    self.progressSection.spacing = 5;
+    self.progressSection.layoutMarginsRelativeArrangement = YES;
+    self.progressSection.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(2, iconSize + iconGap, 0, 0);
+    self.progressSection.hidden = YES;
+    [self addArrangedSubview:self.progressSection];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.boltIcon.widthAnchor constraintEqualToConstant:iconSize],
+        [self.boltIcon.heightAnchor constraintEqualToConstant:iconSize],
+        [self.actionButton.widthAnchor constraintGreaterThanOrEqualToConstant:52],
+        [self.actionButton.heightAnchor constraintGreaterThanOrEqualToConstant:44]
+    ]];
+    return self;
+}
+
+- (void)updateWithManager:(CLBatteryManager *)manager limit:(NSInteger)limit {
+    BOOL active = manager.tempFullChargeOnce;
+    NSString *adapter = manager.adapterDescription;
+    BOOL pluggedIn = manager.externalConnected || manager.externalChargeCapable
+        || CLManagerLooksChargingForDisplay(manager)
+        || ([adapter isKindOfClass:[NSString class]] && adapter.length > 0 && ![adapter isEqualToString:@"batt"]);
+    BOOL showProgress = active && pluggedIn;
+
+    UIColor *accent = [UIColor systemGreenColor];
+    UIColor *detailColor = [UIColor secondaryLabelColor];
+    NSString *detailFormat = CLL(@"充至 100%% 后自动恢复 %ld%%");
+    if (showProgress) {
+        accent = [UIColor systemOrangeColor];
+        detailColor = accent;
+        detailFormat = CLL(@"等待充满 · 完成后自动恢复 %ld%%");
+    } else if (active) {
+        accent = [UIColor systemGrayColor];
+        detailColor = [UIColor systemBlueColor];
+        detailFormat = CLL(@"未接电源 · 插电后充满即恢复 %ld%%");
+    }
+    self.titleLabel.text = active ? CLL(@"临时充满中") : CLL(@"临时充满一次");
+    self.detailLabel.text = [NSString stringWithFormat:detailFormat, (long)limit];
+    self.detailLabel.textColor = detailColor;
+    self.boltIcon.tintColor = accent;
+    self.boltIcon.backgroundColor = [accent colorWithAlphaComponent:0.18];
+    self.actionButton.backgroundColor = [accent colorWithAlphaComponent:showProgress ? 0.10 : 0.16];
+    self.actionButton.layer.borderWidth = showProgress ? 1.0 / UIScreen.mainScreen.scale : 0;
+    self.actionButton.layer.borderColor = [accent colorWithAlphaComponent:0.65].CGColor;
+    [self.actionButton setTitleColor:active && !pluggedIn ? [UIColor secondaryLabelColor] : accent
+                           forState:UIControlStateNormal];
+    [self.actionButton setTitleColor:[UIColor tertiaryLabelColor] forState:UIControlStateDisabled];
+    [self.actionButton setTitle:active ? CLL(@"取消") : CLL(@"启动") forState:UIControlStateNormal];
+
+    self.progressSection.hidden = !showProgress;
+    if (showProgress) {
+        NSInteger capacity = MIN(MAX(manager.currentCapacity, 0), 100);
+        self.progressBar.progress = capacity / 100.0f;
+        self.currentLabel.text = [NSString stringWithFormat:CLL(@"当前 %ld%%"), (long)capacity];
+    }
+}
+
+@end
+
 @interface CLSettingsViewController ()
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) UIStackView *mainStack;
@@ -5464,11 +5604,11 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 @property (nonatomic, assign) NSInteger chargeAbove;
 @property (nonatomic, strong) UIView *chargeBelowRow;
 @property (nonatomic, strong) UIView *chargeAboveRow;      // 停止充电行
-@property (nonatomic, strong) UIView *tempFullChargeRow;   // 临时充满一次行
+@property (nonatomic, strong) CLTempFullChargeRow *tempFullChargeRow;
+@property (nonatomic, assign) BOOL tempFullChargeRequestPending;
 @property (nonatomic, strong) UIButton *chargeAbovePresetButton;
 @property (nonatomic, strong) UIButton *setChargeAboveCurrentButton;
 @property (nonatomic, strong) UIView *chargeBelowSeparator;
-@property (nonatomic, strong) UIView *tempFullChargeSeparator;
 @property (nonatomic, strong) UIView *tempBelowRow;        // 温度下限行
 @property (nonatomic, strong) UIView *tempAboveRow;        // 温度上限行
 @property (nonatomic, strong) UIView *tempSeparator1;
@@ -6400,6 +6540,7 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
         weakSelf.chargeAbove = adjustedAbove;
         weakSelf.batteryStatus.chargeAbove = adjustedAbove;
         [CLBatteryManager shared].chargeAbove = adjustedAbove;
+        [weakSelf refreshTempFullChargeRow];
         [weakSelf updateSystemControlHintForChargeAbove:adjustedAbove];
     } onLiveChange:^(NSInteger value) {
         // 实时更新电池图标上的标记线
@@ -6414,12 +6555,12 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     }];
     [self attachSetCurrentButtonToChargeAboveRow];
 
-    // 临时充满一次（单发窗口）：充满即自动恢复上限；拔电不清零；点按再次取消
-    [self.limitCard addNavigationRowWithIcon:@"battery.100.bolt"
-        title:CLL(@"临时充满一次") value:[self tempFullChargeStatusLabel]
-        color:[UIColor systemGreenColor] target:self action:@selector(tempFullChargeRowTapped)];
-    self.tempFullChargeRow = self.limitCard.contentStack.arrangedSubviews.lastObject;
-    self.tempFullChargeSeparator = [self.limitCard addSeparator];
+    [self.limitCard addSeparator];
+    self.tempFullChargeRow = [[CLTempFullChargeRow alloc] initWithFrame:CGRectZero];
+    [self.tempFullChargeRow.actionButton addTarget:self action:@selector(tempFullChargeButtonTapped)
+                                  forControlEvents:UIControlEventTouchUpInside];
+    [self.limitCard.contentStack addArrangedSubview:self.tempFullChargeRow];
+    [self refreshTempFullChargeRow];
 
     // 保存分隔线引用
     self.chargeBelowSeparator = [self.limitCard addSeparator];
@@ -6445,40 +6586,37 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 
 #pragma mark - 临时充满一次（单发窗口）
 
-- (NSString *)tempFullChargeStatusLabel {
-    if ([CLBatteryManager shared].tempFullChargeOnce) {
-        return CLL(@"充满中 · 点按取消");
-    }
-    return CLL(@"充至100%后恢复");
-}
-
 - (void)refreshTempFullChargeRow {
-    if (!self.tempFullChargeRow) {
-        return;
-    }
-    [self updateCardValue:self.limitCard title:CLL(@"临时充满一次") value:[self tempFullChargeStatusLabel]];
+    [self.tempFullChargeRow updateWithManager:[CLBatteryManager shared] limit:self.chargeAbove];
+    self.tempFullChargeRow.actionButton.enabled = !self.tempFullChargeRequestPending;
 }
 
-// 武装/取消共用唯一写路径：本地即时回显 → daemon 确认（下轮 get_bat_info 的
-// TempFullChargeActive 为准）；写失败回滚本地状态。
 - (void)setTempFullChargeOnceEnabled:(BOOL)enabled {
-    CLBatteryManager *manager = [CLBatteryManager shared];
-    manager.tempFullChargeOnce = enabled;
+    if (self.tempFullChargeRequestPending) return;
+    self.tempFullChargeRequestPending = YES;
     [self refreshTempFullChargeRow];
     __weak typeof(self) weakSelf = self;
     [[CLAPIClient shared] setConfigWithKey:@"temp_full_charge_once" value:@(enabled) completion:^(NSDictionary * _Nullable response, NSError * _Nullable error) {
-        BOOL ok = (response && [response[@"status"] intValue] == 0);
-        if (!ok) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                // 写失败回滚本地回显（回到操作前状态），下轮轮询以 daemon 为准
-                [CLBatteryManager shared].tempFullChargeOnce = !enabled;
-                [weakSelf refreshTempFullChargeRow];
-            });
-        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CLSettingsViewController *controller = weakSelf;
+            CLBatteryManager *manager = [CLBatteryManager shared];
+            NSNumber *status = response[@"status"];
+            BOOL ok = !error && [status isKindOfClass:[NSNumber class]] && status.integerValue == 0;
+            if (ok) manager.tempFullChargeOnce = enabled;
+            controller.tempFullChargeRequestPending = NO;
+            [controller refreshTempFullChargeRow];
+            [manager refreshBatteryInfo];
+            if (!ok && controller.viewIfLoaded.window && !controller.presentedViewController) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:CLL(@"无法更新临时充满状态")
+                    message:nil preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:CLL(@"确定") style:UIAlertActionStyleDefault handler:nil]];
+                [controller presentViewController:alert animated:YES completion:nil];
+            }
+        });
     }];
 }
 
-- (void)tempFullChargeRowTapped {
+- (void)tempFullChargeButtonTapped {
     CLBatteryManager *manager = [CLBatteryManager shared];
     if (manager.tempFullChargeOnce) {
         // 取消是安全方向：单点直接取消，无需确认（与锁屏屏保按钮同语义）
@@ -6487,13 +6625,16 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     }
     // 武装需确认：临时解除上限属于策略级动作，防误触
     __weak typeof(self) weakSelf = self;
+    NSString *message = [NSString stringWithFormat:
+        CLL(@"将暂时解除 %ld%% 上限，充满后自动恢复。\n中途拔电不失效，可随时手动取消。"), (long)self.chargeAbove];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:CLL(@"临时充满一次？")
-        message:CLL(@"将暂时解除上限，充满后自动恢复。中途拔电不失效，可随时手动取消。")
-        preferredStyle:UIAlertControllerStyleAlert];
+        message:message preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:CLL(@"取消") style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:CLL(@"启动") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    UIAlertAction *start = [UIAlertAction actionWithTitle:CLL(@"启动") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [weakSelf setTempFullChargeOnceEnabled:YES];
-    }]];
+    }];
+    [alert addAction:start];
+    alert.preferredAction = start;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -6610,6 +6751,7 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 
     [self updateSliderValue:self.chargeAboveRow value:value];
     [self updateSliderLabel:self.chargeAboveRow value:value suffix:@"%"];
+    [self refreshTempFullChargeRow];
     [self updateSystemControlHintForChargeAbove:value];
 
     if (emitFeedback) {
@@ -7646,6 +7788,7 @@ static BOOL CLDisplayedPowerStateUsesExternalPower(CLBatteryManager *manager) {
     [self updateSliderValue:self.chargeAboveRow value:chargeAbove];
     [self updateSliderLabel:self.chargeBelowRow value:chargeBelow suffix:@"%"];
     [self updateSliderLabel:self.chargeAboveRow value:chargeAbove suffix:@"%"];
+    [self refreshTempFullChargeRow];
     self.batteryStatus.chargeBelow = chargeBelow;
     self.batteryStatus.chargeAbove = chargeAbove;
     [self updateCardValue:self.powerPathCard title:CLL(@"检查间隔") value:[self holdCheckIntervalLabelForManager:manager]];

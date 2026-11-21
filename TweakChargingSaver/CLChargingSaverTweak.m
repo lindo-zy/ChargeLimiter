@@ -38,7 +38,7 @@
 static NSString * const CLSaverMirrorNotifyName = @"com.chargelimiter.policystate";
 static NSString * const CLSaverActionNotifyName = @"com.chargelimiter.saveraction";
 static const CGFloat CLSaverCardDesignWidth = 344.0;
-static const CGFloat CLSaverCardDesignHeight = 324.0;
+static const CGFloat CLSaverCardDesignHeight = 334.0;
 static const NSTimeInterval CLSaverEchoTimeoutSeconds = 2.0;
 static const NSTimeInterval CLSaverConfirmWindowSeconds = 3.0;
 
@@ -207,6 +207,14 @@ static CLSaverStrategy *CLSaverStrategyForMirror(NSDictionary *mirror) {
 
 #pragma mark - 策略卡（ink = drawRect 文本/环/网格，cta = 真实可点按钮条）
 
+typedef NS_ENUM(NSInteger, CLSaverButtonState) {
+    CLSaverButtonReady,
+    CLSaverButtonConfirming,
+    CLSaverButtonActive,
+    CLSaverButtonPending,
+    CLSaverButtonNoResponse,
+};
+
 static UIColor *CLSaverGreen(void) { return [UIColor colorWithRed:0.44 green:0.93 blue:0.67 alpha:1]; }
 static UIColor *CLSaverOrange(void) { return [UIColor colorWithRed:1.0 green:0.725 blue:0.35 alpha:1]; }
 
@@ -245,6 +253,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 @interface CLSaverCardInk : UIView
 @property (nonatomic, strong) NSDictionary *mirror;
 @property (nonatomic, strong) NSDictionary *battery;
+@property (nonatomic, assign) BOOL confirming;
 @end
 
 @implementation CLSaverCardInk
@@ -272,13 +281,13 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     double designCap = CLSaverDoubleValue(self.battery[@"AppleRawDesignCapacity"], NAN);
     int cycleCount = (int)CLSaverIntValue(self.battery[@"CycleCount"], 0);
 
-    CLSaverText(strategy.heroTitle, CGRectMake(17, 12, 200, 42), 30, UIFontWeightSemibold, white, NSTextAlignmentLeft);
-    CLSaverText(strategy.heroSubtitle, CGRectMake(18, 58, 210, 17), 10.5, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
+    CLSaverText(strategy.heroTitle, CGRectMake(17, 17, 242, 42), 30, UIFontWeightSemibold, white, NSTextAlignmentLeft);
+    CLSaverText(strategy.heroSubtitle, CGRectMake(18, 61, 242, 17), 11, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
 
     // 电量环：填充 = 电量比例；目标刻度 = 停充上限（临时充满时 100%）
     CGFloat ringTarget = tempFull ? 100.0 : (CGFloat)above;
     BOOL targetReached = capacity >= ringTarget;
-    CGPoint center = CGPointMake(304, 44);
+    CGPoint center = CGPointMake(294, 49);
     CGFloat radius = 27;
     UIBezierPath *track = [UIBezierPath bezierPathWithArcCenter:center radius:radius startAngle:-M_PI_2 endAngle:M_PI * 1.5 clockwise:YES];
     track.lineWidth = 4.5;
@@ -304,20 +313,18 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     tick.lineCapStyle = kCGLineCapRound;
     [targetReached ? UIColor.whiteColor : accent setStroke];
     [tick stroke];
-    CLSaverText([NSString stringWithFormat:@"%d%%", capacity], CGRectMake(274, 30, 60, 22), 15, UIFontWeightBold, white, NSTextAlignmentCenter);
-    CLSaverText([NSString stringWithFormat:@"目标 %ld%%", (long)ringTarget], CGRectMake(266, 80, 76, 15), 9, UIFontWeightSemibold, muted, NSTextAlignmentCenter);
+    CLSaverText([NSString stringWithFormat:@"%d%%", capacity], CGRectMake(264, 39, 60, 22), 15, UIFontWeightBold, white, NSTextAlignmentCenter);
+    CLSaverText([NSString stringWithFormat:@"目标 %ld%%", (long)ringTarget], CGRectMake(256, 85, 76, 15), 10, UIFontWeightSemibold, muted, NSTextAlignmentCenter);
 
     [[white colorWithAlphaComponent:0.1] setStroke];
     UIBezierPath *dividers = [UIBezierPath bezierPath];
-    [dividers moveToPoint:CGPointMake(17, 100)];
-    [dividers addLineToPoint:CGPointMake(327, 100)];
-    [dividers moveToPoint:CGPointMake(17, 163)];
-    [dividers addLineToPoint:CGPointMake(327, 163)];
-    for (NSNumber *x in @[@119, @237]) {
+    [dividers moveToPoint:CGPointMake(17, 112)];
+    [dividers addLineToPoint:CGPointMake(327, 112)];
+    [dividers moveToPoint:CGPointMake(17, 169)];
+    [dividers addLineToPoint:CGPointMake(327, 169)];
+    for (NSNumber *x in @[@120, @223]) {
         [dividers moveToPoint:CGPointMake(x.doubleValue, 112)];
-        [dividers addLineToPoint:CGPointMake(x.doubleValue, 150)];
-        [dividers moveToPoint:CGPointMake(x.doubleValue, 175)];
-        [dividers addLineToPoint:CGPointMake(x.doubleValue, 213)];
+        [dividers addLineToPoint:CGPointMake(x.doubleValue, 230)];
     }
     dividers.lineWidth = 0.35;
     [dividers stroke];
@@ -326,7 +333,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     NSString *tempText = isfinite(temperature) ? [NSString stringWithFormat:@"%.1f°C", temperature] : @"—";
     NSString *healthText = (isfinite(maxCap) && isfinite(designCap) && designCap > 0)
         ? [NSString stringWithFormat:@"%.0f%%", maxCap * 100.0 / designCap] : (cycleCount > 0 ? [NSString stringWithFormat:@"%ld 次", (long)cycleCount] : @"—");
-    NSString *tempFullText = tempFull ? @"激活中" : @"未启用";
+    NSString *tempFullText = tempFull ? @"激活中" : (self.confirming ? @"确认中…" : @"未启用");
     NSArray *rowValues = @[
         [NSString stringWithFormat:@"%ld%%", (long)above],
         [NSString stringWithFormat:@"%ld%%", (long)below],
@@ -336,29 +343,30 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         healthText,
     ];
     for (NSUInteger i = 0; i < 6; i++) {
-        CGFloat x = (i % 3) == 0 ? 18 : ((i % 3) == 1 ? 132 : 250);
-        CGFloat y = i < 3 ? 112 : 175;
-        CLSaverText(rowTitles[i], CGRectMake(x, y, 86, 15), 9.5, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
+        CGFloat x = (i % 3) == 0 ? 18 : ((i % 3) == 1 ? 133 : 236);
+        CGFloat y = i < 3 ? 122 : 179;
+        CLSaverText(rowTitles[i], CGRectMake(x, y, 86, 15), 10, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
         UIColor *valueColor = white;
-        if ([rowTitles[i] isEqualToString:@"临时充满"]) valueColor = tempFull ? CLSaverOrange() : dim;
-        CLSaverText(rowValues[i], CGRectMake(x, y + 17, 92, 20), 14, UIFontWeightSemibold, valueColor, NSTextAlignmentLeft);
+        if ([rowTitles[i] isEqualToString:@"临时充满"]) valueColor = (tempFull || self.confirming) ? CLSaverOrange() : dim;
+        CLSaverText(rowValues[i], CGRectMake(x, y + 17, 92, 21), 15, UIFontWeightSemibold, valueColor, NSTextAlignmentLeft);
     }
 
     // 底部状态胶囊 + 恢复条件
-    CGRect badge = CGRectMake(17, 226, 88, 20);
+    CGFloat badgeWidth = strategy.badgeTitle.length > 4 ? 80 : 69;
+    CGRect badge = CGRectMake(17, 234, badgeWidth, 24);
     [[accent colorWithAlphaComponent:0.14] setFill];
-    [[UIBezierPath bezierPathWithRoundedRect:badge cornerRadius:10] fill];
-    CLSaverText(strategy.badgeTitle, CGRectMake(20, 229, 82, 16), 10, UIFontWeightSemibold, accent, NSTextAlignmentCenter);
-    CLSaverText(strategy.recoveryNote, CGRectMake(112, 229, 216, 16), 10, UIFontWeightMedium, muted, NSTextAlignmentRight);
+    [[UIBezierPath bezierPathWithRoundedRect:badge cornerRadius:11] fill];
+    CLSaverText(strategy.badgeTitle, CGRectInset(badge, 4, 5), 11, UIFontWeightSemibold, accent, NSTextAlignmentCenter);
+    CLSaverText(strategy.recoveryNote, CGRectMake(104, 239, 223, 17), 11, UIFontWeightMedium, muted, NSTextAlignmentRight);
     CGContextRestoreGState(context);
 }
 @end
 
 @interface CLSaverCTAView : UIView
-// ctaState: 0 未武装(可启动) / 1 确认态(倒计时) / 2 已武装(可取消) / 3 待回显 / 4 守护未响应
-@property (nonatomic, assign) NSInteger ctaState;
+@property (nonatomic, assign) CLSaverButtonState ctaState;
+@property (nonatomic, copy) NSString *readyTitle;
 @property (nonatomic, assign) CGFloat confirmProgress; // 0..1 确认倒计时进度
-@property (nonatomic, copy) void (^onTap)(NSInteger currentState);
+@property (nonatomic, copy) void (^onTap)(CLSaverButtonState currentState);
 @end
 
 @implementation CLSaverCTAView
@@ -368,14 +376,22 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         self.layer.cornerRadius = 14;
         self.layer.cornerCurve = kCACornerCurveContinuous;
         self.layer.borderWidth = 1.0;
+        self.clipsToBounds = YES;
         self.userInteractionEnabled = YES;
+        self.isAccessibilityElement = YES;
+        self.accessibilityTraits = UIAccessibilityTraitButton;
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
         [self addGestureRecognizer:tap];
     }
     return self;
 }
 - (void)handleTap:(UITapGestureRecognizer *)gesture {
-    if (self.onTap) self.onTap(self.ctaState);
+    [self accessibilityActivate];
+}
+- (BOOL)accessibilityActivate {
+    if (!self.onTap || self.ctaState == CLSaverButtonPending || self.ctaState == CLSaverButtonNoResponse) return NO;
+    self.onTap(self.ctaState);
+    return YES;
 }
 - (void)drawRect:(CGRect)rect {
     UIColor *green = CLSaverGreen();
@@ -384,19 +400,19 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     UIColor *color = green;
     UIColor *border = [green colorWithAlphaComponent:0.35];
     UIColor *fill = [green colorWithAlphaComponent:0.10];
-    if (self.ctaState == 0) {
-        text = @"⚡ 启动临时充满 · 充满后自动恢复上限";
-    } else if (self.ctaState == 1) {
+    if (self.ctaState == CLSaverButtonReady) {
+        text = self.readyTitle ?: @"⚡ 启动临时充满";
+    } else if (self.ctaState == CLSaverButtonConfirming) {
         text = [NSString stringWithFormat:@"再点一次确认 · %.0f 秒内生效", CLSaverConfirmWindowSeconds];
         color = orange;
         border = [orange colorWithAlphaComponent:0.55];
         fill = [orange colorWithAlphaComponent:0.16];
-    } else if (self.ctaState == 2) {
+    } else if (self.ctaState == CLSaverButtonActive) {
         text = @"取消临时充满";
         color = orange;
         border = [orange colorWithAlphaComponent:0.45];
         fill = [orange colorWithAlphaComponent:0.10];
-    } else if (self.ctaState == 3) {
+    } else if (self.ctaState == CLSaverButtonPending) {
         text = @"已发送 · 等待守护确认…";
         color = [UIColor colorWithWhite:1 alpha:0.7];
         border = [UIColor colorWithWhite:1 alpha:0.2];
@@ -407,18 +423,22 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         border = [UIColor colorWithWhite:1 alpha:0.12];
         fill = [UIColor colorWithWhite:1 alpha:0.04];
     }
+    self.accessibilityLabel = text;
     self.layer.borderColor = border.CGColor;
     self.backgroundColor = fill;
+    CGRect bounds = self.bounds;
+    CGFloat scale = bounds.size.width / (CLSaverCardDesignWidth - 34.0);
+    UIFont *font = [UIFont systemFontOfSize:14 * scale weight:UIFontWeightSemibold];
     NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
     style.alignment = NSTextAlignmentCenter;
     style.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [text drawInRect:CGRectInset(rect, 8, 0)
-       withAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold],
+    [text drawInRect:CGRectMake(8, (bounds.size.height - font.lineHeight) / 2, bounds.size.width - 16, ceil(font.lineHeight))
+       withAttributes:@{NSFontAttributeName: font,
                         NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}];
-    if (self.ctaState == 1) {
+    if (self.ctaState == CLSaverButtonConfirming) {
         // 确认倒计时进度条（底边）
-        CGFloat progressWidth = rect.size.width * MAX(0, MIN(self.confirmProgress, 1.0));
-        CGRect bar = CGRectMake(0, rect.size.height - 3, progressWidth, 3);
+        CGFloat progressWidth = bounds.size.width * MAX(0, MIN(self.confirmProgress, 1.0));
+        CGRect bar = CGRectMake(0, bounds.size.height - 3, progressWidth, 3);
         [[orange colorWithAlphaComponent:0.8] setFill];
         [[UIBezierPath bezierPathWithRoundedRect:bar cornerRadius:1.5] fill];
     }
@@ -438,9 +458,10 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         self.clipsToBounds = YES;
         self.layer.borderWidth = 0.5;
         self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
-        self.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.58];
+        self.backgroundColor = [UIColor colorWithRed:0.075 green:0.072 blue:0.095 alpha:0.88];
         self.ink = [[CLSaverCardInk alloc] initWithFrame:self.bounds];
         self.ink.backgroundColor = UIColor.clearColor;
+        self.ink.contentMode = UIViewContentModeRedraw;
         self.ink.opaque = NO;
         self.ink.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self addSubview:self.ink];
@@ -454,19 +475,16 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 }
 // 仅按钮条命中：其余区域返回 nil，触摸继续走锁屏系统手势（Metis 免触控语义的局部化）
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (CGRectContainsPoint(self.cta.frame, point) && self.cta.hidden == NO && self.cta.alpha > 0.01) {
-        return [self.cta hitTest:[self.cta convertPoint:point fromView:self] withEvent:event] ?: self.cta;
-    }
-    return nil;
+    if (self.hidden || self.alpha <= 0.01 || !self.userInteractionEnabled) return nil;
+    return [self.cta hitTest:[self.cta convertPoint:point fromView:self] withEvent:event];
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat scale = self.bounds.size.width / CLSaverCardDesignWidth;
-    CGFloat inkHeight = 254.0 * scale;
-    self.ink.frame = CGRectMake(0, 0, self.bounds.size.width, inkHeight);
-    CGFloat ctaX = 14.0 * scale;
+    self.ink.frame = self.bounds;
+    CGFloat ctaX = 17.0 * scale;
     CGFloat ctaHeight = 44.0 * scale;
-    self.cta.frame = CGRectMake(ctaX, self.bounds.size.height - ctaHeight - 12.0 * scale,
+    self.cta.frame = CGRectMake(ctaX, self.bounds.size.height - ctaHeight - 15.0 * scale,
                                 self.bounds.size.width - ctaX * 2, ctaHeight);
 }
 @end
@@ -478,6 +496,8 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 @property (nonatomic, weak) UIViewController *passcodeController;
 @property (nonatomic, strong) CLSaverCardView *card;
 @property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, strong) NSTimer *confirmTimer;
+@property (nonatomic, assign) NSTimeInterval confirmDeadline;
 @property (nonatomic, strong) dispatch_queue_t samplingQueue;
 @property (nonatomic, strong) NSDictionary *mirror;              // saver_state.plist 内容
 @property (nonatomic, assign) BOOL appeared;
@@ -539,6 +559,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 
 - (void)dealloc {
     [self.timer invalidate];
+    [self.confirmTimer invalidate];
     if (_displayToken >= 0) notify_cancel(_displayToken);
     if (_lockToken >= 0) notify_cancel(_lockToken);
     if (_mirrorToken >= 0) notify_cancel(_mirrorToken);
@@ -573,7 +594,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     if (self.pendingAction == 0) return;
     BOOL armed = self.mirror[@"temp_full_charge_active"] ? [self.mirror[@"temp_full_charge_active"] boolValue] : NO;
     BOOL confirmed = (self.pendingAction == 1 && armed) || (self.pendingAction == 2 && !armed);
-    if (confirmed) {
+    if (self.mirror && confirmed) {
         self.pendingAction = 0;
         return;
     }
@@ -581,7 +602,6 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         NSProcessInfo.processInfo.systemUptime - self.pendingActionTime > CLSaverEchoTimeoutSeconds) {
         self.pendingAction = 0;
         if (self.card) {
-            self.card.cta.ctaState = 4; // 守护未响应
             self.hintShownTime = NSProcessInfo.processInfo.systemUptime;
         }
         return;
@@ -690,7 +710,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
             if (!self.card) {
                 self.card = [[CLSaverCardView alloc] initWithFrame:CGRectZero];
                 __weak typeof(self) weakSelf = self;
-                self.card.cta.onTap = ^(NSInteger currentState) {
+                self.card.cta.onTap = ^(CLSaverButtonState currentState) {
                     [weakSelf handleCTATap:currentState];
                 };
                 // 挂到窗口层：深度合成锁屏的壁纸主体层会盖住 cover sheet 内部视图，
@@ -699,6 +719,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
                 [anchor addSubview:self.card];
                 CLSaverLog(@"state=card-attached anchor=%@", NSStringFromClass(anchor.class));
             }
+            self.card.ink.battery = battery;
             [self layout];
             [self refreshCardContent];
         });
@@ -707,82 +728,81 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 
 - (void)refreshCardContent {
     if (!self.card) return;
-    self.card.ink.mirror = self.mirror;
-    // 按钮态优先级：守护未响应（停留 3s）> 待回显 > 镜像武装态 > 本地确认倒计时
-    if (self.card.cta.ctaState == 4) {
-        if (NSProcessInfo.processInfo.systemUptime - self.hintShownTime < 3.0) return;
-        self.card.cta.ctaState = 0; // 提示期满，回到正常映射
-    }
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    CLSaverButtonState state = CLSaverButtonReady;
     if (self.pendingAction != 0) {
-        self.card.cta.ctaState = 3;
-        return;
+        state = CLSaverButtonPending;
+    } else if (self.hintShownTime > 0 && now - self.hintShownTime < 3.0) {
+        state = CLSaverButtonNoResponse;
+    } else if ([self.mirror[@"temp_full_charge_active"] boolValue]) {
+        state = CLSaverButtonActive;
+    } else if (now < self.confirmDeadline) {
+        state = CLSaverButtonConfirming;
     }
-    BOOL armed = self.mirror[@"temp_full_charge_active"] ? [self.mirror[@"temp_full_charge_active"] boolValue] : NO;
-    NSInteger localState = self.card.cta.ctaState;
-    if (armed) {
-        self.card.cta.ctaState = 2;
-    } else if (localState == 1) {
-        // 确认倒计时进行中（本地态），保持
-    } else {
-        self.card.cta.ctaState = 0;
-    }
+    if (state != CLSaverButtonConfirming && self.confirmTimer) [self stopConfirmCountdown];
+
+    self.card.ink.mirror = self.mirror;
+    self.card.ink.confirming = state == CLSaverButtonConfirming;
+    [self.card.ink setNeedsDisplay];
+
+    NSInteger limit = CLSaverIntValue(self.mirror[@"charge_above"], 100);
+    BOOL atLimit = [self.mirror[@"policy_reason"] isEqual:@"capacity_high"];
+    self.card.cta.readyTitle = atLimit
+        ? @"⚡ 启动临时充满 · 解除上限继续充电"
+        : [NSString stringWithFormat:@"⚡ 启动临时充满 · 充满后自动恢复 %ld%%", (long)limit];
+    self.card.cta.ctaState = state;
     [self.card.cta setNeedsDisplay];
 }
 
 #pragma mark 按钮命令（两击确认 + 触感 + notify 下发 + 回显闭环）
 
-- (void)handleCTATap:(NSInteger)state {
+- (void)handleCTATap:(CLSaverButtonState)state {
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    if (state == 0) {
-        // 未武装 → 确认态（3s 倒计时，超时由 CTA 自身计时还原）
-        self.card.cta.ctaState = 1;
-        self.card.cta.confirmProgress = 1.0;
+    if (state == CLSaverButtonReady) {
         [self startConfirmCountdown];
         [haptic impactOccurred];
-        [self.card.cta setNeedsDisplay];
-    } else if (state == 1) {
-        // 确认 → 下发启动
+    } else if (state == CLSaverButtonConfirming) {
+        BOOL confirmedInTime = NSProcessInfo.processInfo.systemUptime < self.confirmDeadline;
         [self stopConfirmCountdown];
+        if (!confirmedInTime) {
+            [self refreshCardContent];
+            return;
+        }
         UIImpactFeedbackGenerator *heavy = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
         [heavy impactOccurred];
         [self postSaverAction:1];
-    } else if (state == 2) {
+    } else if (state == CLSaverButtonActive) {
         // 取消是安全方向：单点直接下发
         [haptic impactOccurred];
         [self postSaverAction:2];
     }
-    // 待回显(3)/提示(4) 态忽略点击
 }
 
 - (void)startConfirmCountdown {
     [self stopConfirmCountdown];
+    self.confirmDeadline = NSProcessInfo.processInfo.systemUptime + CLSaverConfirmWindowSeconds;
+    self.card.cta.confirmProgress = 1.0;
     __weak typeof(self) weakSelf = self;
-    NSTimeInterval start = NSProcessInfo.processInfo.systemUptime;
-    NSTimer *countdown = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
+    self.confirmTimer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
         typeof(self) strongSelf = weakSelf;
         if (!strongSelf || !strongSelf.card) { [timer invalidate]; return; }
-        if (strongSelf.card.cta.ctaState != 1) { [timer invalidate]; return; }
-        NSTimeInterval elapsed = NSProcessInfo.processInfo.systemUptime - start;
-        strongSelf.card.cta.confirmProgress = 1.0 - elapsed / CLSaverConfirmWindowSeconds;
-        [strongSelf.card.cta setNeedsDisplay];
-        if (elapsed >= CLSaverConfirmWindowSeconds) {
-            [timer invalidate];
-            // 超时还原：镜像里仍未武装才回退（防止与 daemon 回显竞态）
-            BOOL armed = strongSelf.mirror[@"temp_full_charge_active"] ? [strongSelf.mirror[@"temp_full_charge_active"] boolValue] : NO;
-            if (!armed && strongSelf.pendingAction == 0 && strongSelf.card.cta.ctaState == 1) {
-                strongSelf.card.cta.ctaState = 0;
-                [strongSelf.card.cta setNeedsDisplay];
-            }
+        NSTimeInterval remaining = strongSelf.confirmDeadline - NSProcessInfo.processInfo.systemUptime;
+        if (remaining <= 0) {
+            [strongSelf stopConfirmCountdown];
+            [strongSelf refreshCardContent];
+            return;
         }
+        strongSelf.card.cta.confirmProgress = remaining / CLSaverConfirmWindowSeconds;
+        [strongSelf.card.cta setNeedsDisplay];
     }];
-    [NSRunLoop.mainRunLoop addTimer:countdown forMode:NSRunLoopCommonModes];
-    objc_setAssociatedObject(self.card.cta, "countdownTimer", countdown, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [NSRunLoop.mainRunLoop addTimer:self.confirmTimer forMode:NSRunLoopCommonModes];
+    [self refreshCardContent];
 }
 
 - (void)stopConfirmCountdown {
-    NSTimer *countdown = objc_getAssociatedObject(self.card.cta, "countdownTimer");
-    [countdown invalidate];
-    objc_setAssociatedObject(self.card.cta, "countdownTimer", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self.confirmTimer invalidate];
+    self.confirmTimer = nil;
+    self.confirmDeadline = 0;
 }
 
 - (void)postSaverAction:(NSInteger)action {
@@ -796,10 +816,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     CLSaverLog(@"state=action-posted action=%ld", (long)action);
     self.pendingAction = action;
     self.pendingActionTime = NSProcessInfo.processInfo.systemUptime;
-    if (self.card) {
-        self.card.cta.ctaState = 3;
-        [self.card.cta setNeedsDisplay];
-    }
+    [self refreshCardContent];
 }
 
 #pragma mark 通知栈让位（Metis 有界扫描修剪版）
