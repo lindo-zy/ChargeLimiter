@@ -30,6 +30,7 @@
 #import <IOKit/IOKitLib.h>
 #import <substrate.h>
 #import <libroot/libroot.h>
+#import <mach-o/dyld.h>
 #include <math.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -41,7 +42,57 @@ static const CGFloat CLSaverCardDesignHeight = 324.0;
 static const NSTimeInterval CLSaverEchoTimeoutSeconds = 2.0;
 static const NSTimeInterval CLSaverConfirmWindowSeconds = 3.0;
 
+// 诊断日志：syslog 可见（idevicesyslog grep CLSaver）。状态翻转才打，避免刷屏。
+static void CLSaverLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[CLSaver] %@", message);
+}
+
 #pragma mark - 电池直读（Metis 同款原语）
+
+// jbroot 前缀解析（SpringBoard 注入进程专用）：优先从 dyld 镜像列表里扫描 tweak
+// 自身 dylib 路径推导——tweak 必装在 <jbroot>/Library/MobileSubstrate/DynamicLibraries/
+// 下，截取 "/.jbroot-XXXX" 前缀即可（utils.mm resolveJbRootFromSelfExe 同款模式）。
+// libroot_dyn_jbrootpath 只作兜底：App/daemon 由 roothide launchd 拉起自带解析上下文，
+// 注入进程（SpringBoard）里 libroot 动态解析的可用性没有保证，不能作为唯一通路。
+static NSString *CLSaverJbRootPath(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (!name) continue;
+            NSString *path = [NSString stringWithUTF8String:name];
+            NSRange dot = [path rangeOfString:@"/.jbroot-"];
+            if (dot.location == NSNotFound) continue;
+            if (![path hasSuffix:@"CLChargingSaver.dylib"]) continue;
+            NSString *prefix = [path substringToIndex:dot.location + dot.length];
+            if (prefix.length > 0 && [path length] > prefix.length &&
+                [path characterAtIndex:prefix.length] == '/') {
+                cached = prefix;
+                break;
+            }
+        }
+        if (cached.length == 0) {
+            char resolved[PATH_MAX];
+            const char *r = libroot_dyn_jbrootpath("/", resolved);
+            if (r) {
+                NSString *root = [NSString stringWithUTF8String:r];
+                root = [root stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                while (root.length > 1 && [root hasSuffix:@"/"]) {
+                    root = [root substringToIndex:root.length - 1];
+                }
+                if ([root rangeOfString:@"/.jbroot-"].location != NSNotFound) cached = root;
+            }
+        }
+        CLSaverLog(@"state=jbroot-resolve result=%@", cached ?: @"FAILED");
+    });
+    return cached;
+}
 
 static NSDictionary *CLSaverReadBattery(void) {
     // 仅探测电池服务节点；注册表读数只发生在采样队列，绝不进 SpringBoard 布局路径。
@@ -63,29 +114,32 @@ static NSDictionary *CLSaverReadBattery(void) {
 }
 
 static BOOL CLSaverDeviceLocked(void) {
-    // SBLockScreenManager isUILocked：签名探测式调用（Metis 同款），旧系统签名不符
-    // 一律按未锁处理（宁可不显示，不可误显示）。
+    // SBLockScreenManager isUILocked：签名探测式调用（Metis 同款）。签名探测本身
+    // 失败（类/方法缺失）→ fail-open 按「已锁」处理：宿主是 cover sheet 已隐含锁屏
+    // 语境；isUILocked 显式返回 NO 时才按未锁拦截。
     Class cls = NSClassFromString(@"SBLockScreenManager");
     SEL shared = NSSelectorFromString(@"sharedInstance"), locked = NSSelectorFromString(@"isUILocked");
     NSMethodSignature *factory = [cls methodSignatureForSelector:shared];
-    if (!factory || factory.numberOfArguments != 2 || strcmp(factory.methodReturnType, "@")) return NO;
+    if (!factory || factory.numberOfArguments != 2 || strcmp(factory.methodReturnType, "@")) return YES;
     @try {
         id manager = ((id (*)(id, SEL))objc_msgSend)(cls, shared);
         NSMethodSignature *signature = [manager methodSignatureForSelector:locked];
         if (!signature || signature.numberOfArguments != 2 ||
-            (strcmp(signature.methodReturnType, "B") && strcmp(signature.methodReturnType, "c"))) return NO;
+            (strcmp(signature.methodReturnType, "B") && strcmp(signature.methodReturnType, "c"))) return YES;
         return ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
-    } @catch (__unused NSException *exception) { return NO; }
+    } @catch (__unused NSException *exception) { return YES; }
 }
 
-static BOOL CLSaverBool(id object, NSString *name, BOOL fallback) {
+// 私有 selector 读数：缺失（或签名不符）时返回 missingValue，存在时返回真实值。
+// 门槛判据用它做 fail-open——iOS 版本差异导致的 selector 缺失不应让屏保永不显示。
+static BOOL CLSaverBoolOrMissing(id object, NSString *name, BOOL missingValue) {
     SEL selector = NSSelectorFromString(name);
     NSMethodSignature *signature = [object methodSignatureForSelector:selector];
     if (!signature || signature.numberOfArguments != 2 ||
-        (strcmp(signature.methodReturnType, "B") && strcmp(signature.methodReturnType, "c"))) return fallback;
+        (strcmp(signature.methodReturnType, "B") && strcmp(signature.methodReturnType, "c"))) return missingValue;
     @try {
         return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector);
-    } @catch (__unused NSException *exception) { return fallback; }
+    } @catch (__unused NSException *exception) { return missingValue; }
 }
 
 #pragma mark - 策略文案映射（与 App CLHistoryPolicyStateLabel 同源语义）
@@ -417,6 +471,9 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 @property (nonatomic, assign) NSInteger pendingAction;           // 0 无 / 1 启动 / 2 取消
 @property (nonatomic, assign) NSTimeInterval pendingActionTime;
 @property (nonatomic, assign) NSTimeInterval hintShownTime;      // 「守护未响应」提示起始时间
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *lastGateReasons; // 门槛诊断去重
+@property (nonatomic, copy) NSString *lastBatteryLogState;       // 电池采样诊断去重
+@property (nonatomic, copy) NSString *lastMirrorLogState;        // 镜像状态诊断去重
 @property (nonatomic, assign) int displayToken;
 @property (nonatomic, assign) int lockToken;
 @property (nonatomic, assign) int mirrorToken;
@@ -471,12 +528,23 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 #pragma mark 镜像读取与按钮回显
 
 - (void)reloadMirror {
-    char resolved[PATH_MAX];
-    const char *jb = libroot_dyn_jbrootpath("/var/mobile/ChargeLimiter", resolved);
-    if (!jb) return;
-    NSString *path = [[NSString stringWithUTF8String:jb] stringByAppendingPathComponent:@"saver_state.plist"];
+    NSString *jbRoot = CLSaverJbRootPath();
+    if (jbRoot.length == 0) {
+        CLSaverLog(@"state=mirror-resolve-failed");
+        return;
+    }
+    NSString *path = [jbRoot stringByAppendingPathComponent:@"var/mobile/ChargeLimiter/saver_state.plist"];
     NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
     self.mirror = [dict isKindOfClass:[NSDictionary class]] ? dict : nil;
+    BOOL exists = self.mirror != nil;
+    BOOL daemonEnable = self.mirror[@"daemon_enable"] ? [self.mirror[@"daemon_enable"] boolValue] : NO;
+    BOOL saverEnable = self.mirror[@"saver_enabled"] ? [self.mirror[@"saver_enabled"] boolValue] : NO;
+    BOOL tempFull = self.mirror[@"temp_full_charge_active"] ? [self.mirror[@"temp_full_charge_active"] boolValue] : NO;
+    NSString *state = [NSString stringWithFormat:@"exists=%d daemon=%d saver=%d tempfull=%d", exists, daemonEnable, saverEnable, tempFull];
+    if (![state isEqualToString:self.lastMirrorLogState]) {
+        self.lastMirrorLogState = state;
+        CLSaverLog(@"state=mirror %@ path=%@", state, path);
+    }
     [self resolvePendingEcho];
     [self refreshCardContent];
 }
@@ -511,12 +579,46 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 - (BOOL)canShow {
     UIView *view = self.host.viewIfLoaded;
     if (!self.saverFeatureEnabled) return NO;
-    return self.appeared && self.displayOn && !self.passcodeController && view.window && !view.hidden &&
-        view.bounds.size.height > view.bounds.size.width && CLSaverDeviceLocked() &&
-        CLSaverBool(self.host, @"_isMainPageShowing", NO) &&
-        !CLSaverBool(self.host, @"_isPageContentHidden", YES) &&
-        !CLSaverBool(self.host, @"hasContentAboveCoverSheet", YES) &&
-        !CLSaverBool(self.host, @"_isPresentingPosterSwitcher", YES);
+    BOOL enabled = self.appeared && self.displayOn && !self.passcodeController && view.window && !view.hidden &&
+        view.bounds.size.height > view.bounds.size.width && CLSaverDeviceLocked();
+    if (!enabled) {
+        NSString *reason = self.passcodeController ? @"passcode" :
+            (!self.appeared ? @"not-appeared" :
+            (!self.displayOn ? @"display-off" :
+            (!view.window ? @"no-window" :
+            (view.bounds.size.height <= view.bounds.size.width ? @"landscape" : @"not-locked"))));
+        [self logGateFlip:@"core" reason:reason];
+        return NO;
+    }
+    // 私有 selector 门槛 fail-open：selector 在该 iOS 版本缺失时按「不阻塞」处理，
+    // 只有真实存在且返回阻塞值时才隐藏（iOS 17 上缺失任何一个都会导致永不显示）。
+    BOOL mainPage = CLSaverBoolOrMissing(self.host, @"_isMainPageShowing", YES);
+    BOOL pageHidden = CLSaverBoolOrMissing(self.host, @"_isPageContentHidden", NO);
+    BOOL contentAbove = CLSaverBoolOrMissing(self.host, @"hasContentAboveCoverSheet", NO);
+    BOOL posterSwitcher = CLSaverBoolOrMissing(self.host, @"_isPresentingPosterSwitcher", NO);
+    if (!mainPage || pageHidden || contentAbove || posterSwitcher) {
+        NSString *reason = !mainPage ? @"not-main-page" :
+            (pageHidden ? @"page-content-hidden" :
+            (contentAbove ? @"content-above" : @"poster-switcher"));
+        [self logGateFlip:@"cover" reason:reason];
+        return NO;
+    }
+    [self logGatePass];
+    return YES;
+}
+
+// 门槛诊断：同一原因只打一次（翻转才打），syslog 里 grep CLSaver 即可定位卡在哪一关。
+- (void)logGateFlip:(NSString *)group reason:(NSString *)reason {
+    if ([self.lastGateReasons[group] isEqualToString:reason]) return;
+    if (!self.lastGateReasons) self.lastGateReasons = [NSMutableDictionary new];
+    self.lastGateReasons[group] = reason;
+    CLSaverLog(@"state=gate-blocked gate=%@ reason=%@ feature=%@", group, reason, self.saverFeatureEnabled ? @"yes" : @"no");
+}
+
+- (void)logGatePass {
+    if (self.lastGateReasons.count == 0) return;
+    [self.lastGateReasons removeAllObjects];
+    CLSaverLog(@"state=gate-pass");
 }
 
 #pragma mark 刷新循环（1s tick，0.8s 采样节流，Metis 同款）
@@ -556,6 +658,13 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
             if (generation != self.generation || ![self canShow]) return;
             BOOL externalConnected = CLSaverIntValue(battery[@"ExternalConnected"], 0) != 0;
             BOOL isCharging = CLSaverIntValue(battery[@"IsCharging"], 0) != 0;
+            NSString *batteryState = [NSString stringWithFormat:@"connected=%d charging=%d capacity=%d",
+                externalConnected, isCharging,
+                (int)CLSaverIntValue(battery[@"CurrentCapacity"], 0)];
+            if (![batteryState isEqualToString:self.lastBatteryLogState]) {
+                self.lastBatteryLogState = batteryState;
+                CLSaverLog(@"state=battery %@", batteryState);
+            }
             // 充电屏保只在「已连接外部电源」的充电会话内显示；拔电即收卡
             if (!externalConnected && !isCharging) { [self stop]; return; }
             [self ensureTimer];
@@ -569,6 +678,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
                 // 窗口是保证在其之上的最低层（Metis 同款注释与结论）
                 UIView *anchor = self.host.view.window ?: self.host.view;
                 [anchor addSubview:self.card];
+                CLSaverLog(@"state=card-attached anchor=%@", NSStringFromClass(anchor.class));
             }
             [self layout];
             [self refreshCardContent];
@@ -664,6 +774,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     });
     notify_set_state(postToken, (uint64_t)action);
     notify_post(CLSaverActionNotifyName.UTF8String);
+    CLSaverLog(@"state=action-posted action=%ld", (long)action);
     self.pendingAction = action;
     self.pendingActionTime = NSProcessInfo.processInfo.systemUptime;
     if (self.card) {
@@ -761,6 +872,9 @@ static CGFloat CLSaverCoverSheetNotificationTopY(UIViewController *host) {
 #pragma mark 卡片生命周期
 
 - (void)stop {
+    if (self.card) {
+        CLSaverLog(@"state=card-removed");
+    }
     self.generation++;
     [self stopConfirmCountdown];
     [self.timer invalidate];
@@ -878,11 +992,18 @@ static void CLSaverInstall(void) {
         CLSaverMethodSupported(passcode, passcodeDisappear, YES)) {
         MSHookMessageEx(passcode, passcodeAppear, (IMP)CLSaverPasscodeAppear, (IMP *)&CLSaverOriginalPasscodeAppear);
         MSHookMessageEx(passcode, passcodeDisappear, (IMP)CLSaverPasscodeDisappear, (IMP *)&CLSaverOriginalPasscodeDisappear);
+    } else {
+        CLSaverLog(@"state=passcode-hooks-unavailable");
     }
     Class cls = NSClassFromString(@"CSCoverSheetViewController");
     SEL appear = @selector(viewDidAppear:), disappear = @selector(viewWillDisappear:), layout = @selector(viewDidLayoutSubviews);
+    if (!cls) {
+        CLSaverLog(@"state=install-failed reason=cover-sheet-class-missing");
+        return;
+    }
     if (!CLSaverMethodSupported(cls, appear, YES) || !CLSaverMethodSupported(cls, disappear, YES) ||
         !CLSaverMethodSupported(cls, layout, NO)) {
+        CLSaverLog(@"state=install-failed reason=hook-signature-mismatch");
         return; // hook 不可用：功能静默禁用，绝不影响锁屏
     }
     MSHookMessageEx(cls, appear, (IMP)CLSaverAppear, (IMP *)&CLSaverOriginalAppear);
@@ -902,6 +1023,7 @@ static void CLSaverInstall(void) {
         !strcmp([pageSignature getArgumentTypeAtIndex:2], "Q")) {
         MSHookMessageEx(cls, pageIndex, (IMP)CLSaverPageIndex, (IMP *)&CLSaverOriginalPageIndex);
     }
+    CLSaverLog(@"state=installed host=%@", NSStringFromClass(cls));
 }
 
 __attribute__((constructor)) static void CLSaverBootstrap(void) {
