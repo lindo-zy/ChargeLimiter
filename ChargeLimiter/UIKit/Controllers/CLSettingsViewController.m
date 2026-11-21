@@ -5443,6 +5443,7 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *detailLabel;
 @property (nonatomic, strong) UIButton *actionButton;
+@property (nonatomic, strong) UIView *actionButtonBackground;
 @property (nonatomic, strong) UIStackView *progressSection;
 @property (nonatomic, strong) UIProgressView *progressBar;
 @property (nonatomic, strong) UILabel *currentLabel;
@@ -5461,7 +5462,7 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     self.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(10, kCLCardIconLeading, 10, kCLCardIconLeading);
 
     const CGFloat iconSize = 30;
-    const CGFloat iconGap = kCLCardTitleLeading - kCLCardIconLeading - iconSize;
+    const CGFloat iconGap = 11;
     self.boltIcon = [[UIImageView alloc] initWithImage:CLSymbolImage(@"bolt.fill",
         [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold])];
     self.boltIcon.contentMode = UIViewContentModeCenter;
@@ -5487,9 +5488,13 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
         scaledFontForFont:[UIFont systemFontOfSize:14 weight:UIFontWeightSemibold]];
     self.actionButton.titleLabel.adjustsFontForContentSizeCategory = YES;
     self.actionButton.contentEdgeInsets = UIEdgeInsetsMake(6, 12, 6, 12);
-    self.actionButton.layer.cornerRadius = 13;
     [self.actionButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self.actionButton setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    self.actionButtonBackground = [[UIView alloc] initWithFrame:CGRectZero];
+    self.actionButtonBackground.translatesAutoresizingMaskIntoConstraints = NO;
+    self.actionButtonBackground.userInteractionEnabled = NO;
+    self.actionButtonBackground.layer.cornerRadius = 13;
+    [self.actionButton insertSubview:self.actionButtonBackground atIndex:0];
 
     UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[self.boltIcon, labels, self.actionButton]];
     header.alignment = UIStackViewAlignmentCenter;
@@ -5530,7 +5535,11 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
         [self.boltIcon.widthAnchor constraintEqualToConstant:iconSize],
         [self.boltIcon.heightAnchor constraintEqualToConstant:iconSize],
         [self.actionButton.widthAnchor constraintGreaterThanOrEqualToConstant:52],
-        [self.actionButton.heightAnchor constraintGreaterThanOrEqualToConstant:44]
+        [self.actionButton.heightAnchor constraintGreaterThanOrEqualToConstant:44],
+        [self.actionButtonBackground.leadingAnchor constraintEqualToAnchor:self.actionButton.leadingAnchor],
+        [self.actionButtonBackground.trailingAnchor constraintEqualToAnchor:self.actionButton.trailingAnchor],
+        [self.actionButtonBackground.centerYAnchor constraintEqualToAnchor:self.actionButton.centerYAnchor],
+        [self.actionButtonBackground.heightAnchor constraintEqualToAnchor:self.actionButton.heightAnchor constant:-12]
     ]];
     return self;
 }
@@ -5560,9 +5569,9 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     self.detailLabel.textColor = detailColor;
     self.boltIcon.tintColor = accent;
     self.boltIcon.backgroundColor = [accent colorWithAlphaComponent:0.18];
-    self.actionButton.backgroundColor = [accent colorWithAlphaComponent:showProgress ? 0.10 : 0.16];
-    self.actionButton.layer.borderWidth = showProgress ? 1.0 / UIScreen.mainScreen.scale : 0;
-    self.actionButton.layer.borderColor = [accent colorWithAlphaComponent:0.65].CGColor;
+    self.actionButtonBackground.backgroundColor = [accent colorWithAlphaComponent:showProgress ? 0.10 : 0.16];
+    self.actionButtonBackground.layer.borderWidth = showProgress ? 1.0 / UIScreen.mainScreen.scale : 0;
+    self.actionButtonBackground.layer.borderColor = [accent colorWithAlphaComponent:0.65].CGColor;
     [self.actionButton setTitleColor:active && !pluggedIn ? [UIColor secondaryLabelColor] : accent
                            forState:UIControlStateNormal];
     [self.actionButton setTitleColor:[UIColor tertiaryLabelColor] forState:UIControlStateDisabled];

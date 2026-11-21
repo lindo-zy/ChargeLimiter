@@ -372,7 +372,8 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 @implementation CLSaverCTAView
 - (instancetype)initWithFrame:(CGRect)frame {
     if ((self = [super initWithFrame:frame])) {
-        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.30];
+        self.backgroundColor = UIColor.clearColor;
+        self.opaque = NO;
         self.layer.cornerRadius = 14;
         self.layer.cornerCurve = kCACornerCurveContinuous;
         self.layer.borderWidth = 1.0;
@@ -400,8 +401,9 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     UIColor *color = green;
     UIColor *border = [green colorWithAlphaComponent:0.35];
     UIColor *fill = [green colorWithAlphaComponent:0.10];
-    if (self.ctaState == CLSaverButtonReady) {
-        text = self.readyTitle ?: @"⚡ 启动临时充满";
+    BOOL showsBolt = self.ctaState == CLSaverButtonReady;
+    if (showsBolt) {
+        text = self.readyTitle ?: @"启动临时充满";
     } else if (self.ctaState == CLSaverButtonConfirming) {
         text = [NSString stringWithFormat:@"再点一次确认 · %.0f 秒内生效", CLSaverConfirmWindowSeconds];
         color = orange;
@@ -425,16 +427,28 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     }
     self.accessibilityLabel = text;
     self.layer.borderColor = border.CGColor;
-    self.backgroundColor = fill;
     CGRect bounds = self.bounds;
+    [fill setFill];
+    UIRectFill(bounds);
+
     CGFloat scale = bounds.size.width / (CLSaverCardDesignWidth - 34.0);
     UIFont *font = [UIFont systemFontOfSize:14 * scale weight:UIFontWeightSemibold];
     NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
     style.alignment = NSTextAlignmentCenter;
     style.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [text drawInRect:CGRectMake(8, (bounds.size.height - font.lineHeight) / 2, bounds.size.width - 16, ceil(font.lineHeight))
-       withAttributes:@{NSFontAttributeName: font,
-                        NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}];
+    NSDictionary *attributes = @{NSFontAttributeName: font, NSForegroundColorAttributeName: color,
+                                 NSParagraphStyleAttributeName: style};
+    UIImage *bolt = showsBolt ? [UIImage systemImageNamed:@"bolt.fill"
+        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * scale weight:UIImageSymbolWeightSemibold]] : nil;
+    CGFloat iconSpace = bolt ? bolt.size.width + 7 * scale : 0;
+    CGFloat textWidth = MIN(ceil([text sizeWithAttributes:attributes].width), bounds.size.width - 16 - iconSpace);
+    CGFloat leading = (bounds.size.width - iconSpace - textWidth) / 2;
+    if (bolt) {
+        UIImage *icon = [bolt imageWithTintColor:UIColor.systemYellowColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+        [icon drawAtPoint:CGPointMake(leading, (bounds.size.height - icon.size.height) / 2)];
+    }
+    [text drawInRect:CGRectMake(leading + iconSpace, (bounds.size.height - font.lineHeight) / 2, textWidth, ceil(font.lineHeight))
+       withAttributes:attributes];
     if (self.ctaState == CLSaverButtonConfirming) {
         // 确认倒计时进度条（底边）
         CGFloat progressWidth = bounds.size.width * MAX(0, MIN(self.confirmProgress, 1.0));
@@ -748,8 +762,8 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     NSInteger limit = CLSaverIntValue(self.mirror[@"charge_above"], 100);
     BOOL atLimit = [self.mirror[@"policy_reason"] isEqual:@"capacity_high"];
     self.card.cta.readyTitle = atLimit
-        ? @"⚡ 启动临时充满 · 解除上限继续充电"
-        : [NSString stringWithFormat:@"⚡ 启动临时充满 · 充满后自动恢复 %ld%%", (long)limit];
+        ? @"启动临时充满 · 解除上限继续充电"
+        : [NSString stringWithFormat:@"启动临时充满 · 充满后自动恢复 %ld%%", (long)limit];
     self.card.cta.ctaState = state;
     [self.card.cta setNeedsDisplay];
 }
