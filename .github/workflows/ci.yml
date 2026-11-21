@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: Verify build (iOS16/17)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      THEOS: /Users/runner/work/_theos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install ldid dpkg make
+
+      - name: Pin Xcode 16.2
+        run: |
+          # 与 release.yml 相同的理由：theos 17.0 overlay 需要 18.2 无守卫 SDK。
+          sudo xcode-select -s /Applications/Xcode_16.2.0.app
+          xcodebuild -version
+
+      - name: Set up Theos (roothide fork)
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          test -f "$THEOS/vendor/lib/libroot.a"
+
+      - name: Prepare SDKs
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          XCODE_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p "$THEOS/sdks/iPhoneOS17.0.sdk/System/Library/PrivateFrameworks"
+          ln -s "$XCODE_SDK/System/Library/Frameworks" "$THEOS/sdks/iPhoneOS17.0.sdk/System/Library/Frameworks"
+          ln -s "$XCODE_SDK/usr" "$THEOS/sdks/iPhoneOS17.0.sdk/usr"
+          ln -s "$XCODE_SDK/SDKSettings.plist" "$THEOS/sdks/iPhoneOS17.0.sdk/SDKSettings.plist"
+          echo "Xcode iPhoneOS SDK: $XCODE_SDK"
+
+      - name: Build + package check (both targets)
+        run: ./build.sh

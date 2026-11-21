@@ -4,7 +4,7 @@
 
 每个版本按固定结构写：先一段白话说明这版做了什么、为什么，再按 **新增 / 变更 / 修复** 三类列出用户真正会感知到的变化。条目写「是什么 + 有什么用」，不写实现细节；同类改动合并成一条，不罗列 commit。格式参考 [Keep a Changelog](https://keepachangelog.com/) 的分类约定，措辞参考成熟项目的发布说明——写给使用者，不是写给git log。
 
-## 未发布
+## v1.17.6 - 2026-11-21
 
 这一版没有功能变化：仓库从 MonkeyDev Xcode 工程**完整迁移为 Theos roothide 工程**，不再维护 rootless / rootful / TrollStore 出包。安装方式、功能与 roothide 安装约定完全不变，变的只有包的形态。
 

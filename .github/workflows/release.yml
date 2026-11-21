@@ -1,4 +1,4 @@
-name: Release
+name: release
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的 tag，例如 v1.17.5"
+        description: "要发布的 tag，例如 v1.17.6"
         required: true
         type: string
 
@@ -20,48 +20,56 @@ concurrency:
 
 jobs:
   build-and-release:
+    name: Build & Release (iOS16/17)
     runs-on: macos-15
+    timeout-minutes: 60
     env:
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
       RELEASE_REPO: ${{ github.repository }}
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      THEOS: /Users/runner/work/_theos
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
+      - uses: actions/checkout@v4
 
-      - name: Select Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - name: Install packaging tools
-        run: brew install dpkg ldid
-
-      # Theos roothide 工程：双 SDK（iPhoneOS16.5 / 17.0）来自 theos/sdks，
-      # jbroot() 静态库 libroot.a 来自 roothide/theos 的 vendor。
-      - name: Prepare Theos (roothide)
+      - name: Install build dependencies
         run: |
-          set -euo pipefail
-          THEOS_DIR="$RUNNER_TEMP/theos-roothide"
-          git clone --depth 1 --recursive https://github.com/roothide/theos.git "$THEOS_DIR"
-          if [ ! -d "$THEOS_DIR/sdks/iPhoneOS16.5.sdk" ] || [ ! -d "$THEOS_DIR/sdks/iPhoneOS17.0.sdk" ]; then
-            rm -rf "$THEOS_DIR/sdks"
-            git clone --depth 1 https://github.com/theos/sdks.git "$THEOS_DIR/sdks"
-          fi
-          test -d "$THEOS_DIR/sdks/iPhoneOS16.5.sdk"
-          test -d "$THEOS_DIR/sdks/iPhoneOS17.0.sdk"
-          test -f "$THEOS_DIR/vendor/include/IOKit/hid/IOHIDService.h"
-          test -f "$THEOS_DIR/vendor/include/MobileCoreServices/LSApplicationProxy.h"
-          test -f "$THEOS_DIR/vendor/lib/libroot.a" || {
-            echo "[ERR] libroot.a missing from roothide theos vendor (jbroot() static link)" >&2
-            exit 1
-          }
-          echo "THEOS=$THEOS_DIR" >> "$GITHUB_ENV"
+          brew install ldid dpkg make
+
+      - name: Pin Xcode 16.2
+        run: |
+          # iOS 18.4+ SDK 的 c_standard_library.modulemap 带
+          # found_incompatible_headers__check_search_paths 守卫，会让
+          # theos 的 17.0 overlay 在 -fmodules 下编译失败；且 theos 的
+          # Darwin.mk 会把 DEVELOPER_DIR 重置为 xcode-select 路径，
+          # 所以这里必须用 xcode-select 钉到 16.2（iPhoneOS18.2.sdk，无守卫）。
+          sudo xcode-select -s /Applications/Xcode_16.2.0.app
+          xcodebuild -version
+
+      - name: Set up Theos (roothide fork)
+        run: |
+          # --recursive 拉齐 vendor 子模块：vendor/lib = roothide/lib（含
+          # libroot.a，jbroot() 静态链接依赖）。
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          test -f "$THEOS/vendor/lib/libroot.a"
+
+      - name: Prepare SDKs
+        run: |
+          # iPhoneOS16.5：theos/sdks 提供（含私有框架 tbd）。
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          # iPhoneOS17.0：theos/sdks 未收录；用 runner Xcode 的 iOS SDK 组装
+          # overlay（公开框架 / usr 链接；部署线 14.0）。本项目链接的私有框架
+          # （IOKit / BackBoardServices / GraphicsServices）全部走仓库 tbd/ 存根
+          # 按路径链接，不依赖 SDK 内 PrivateFrameworks，无需额外 stub。
+          XCODE_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p "$THEOS/sdks/iPhoneOS17.0.sdk/System/Library/PrivateFrameworks"
+          ln -s "$XCODE_SDK/System/Library/Frameworks" "$THEOS/sdks/iPhoneOS17.0.sdk/System/Library/Frameworks"
+          ln -s "$XCODE_SDK/usr" "$THEOS/sdks/iPhoneOS17.0.sdk/usr"
+          ln -s "$XCODE_SDK/SDKSettings.plist" "$THEOS/sdks/iPhoneOS17.0.sdk/SDKSettings.plist"
+          echo "Xcode iPhoneOS SDK: $XCODE_SDK"
 
       - name: Verify release tag matches control version
         run: |
@@ -74,7 +82,7 @@ jobs:
           fi
           plutil -extract CFBundleShortVersionString raw -o - ChargeLimiter/Info.plist | grep -qx "$TAG_VERSION"
 
-      - name: Build packages
+      - name: Build packages (both targets)
         run: ./build.sh
 
       - name: Verify expected release assets
