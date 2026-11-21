@@ -395,12 +395,12 @@ curl http://127.0.0.1:1230 -d '{"api":"get_conf","key":"enable"}' -H "content-ty
 
 ## 安装产物与下载
 
-构建脚本产出两类 roothide 发布包（写入 `out/`）：
+构建脚本产出两类 roothide 发布包（写入 `packages/<label>/`，本地只保留最新一次构建）：
 
 | 环境 | 产物 | 包架构 |
 | --- | --- | --- |
-| 越狱 roothide（iOS 16.5 SDK 构建） | `ChargeLimiter_<版本>_roothide_ios16_arm64e.deb` | iphoneos-arm64e |
-| 越狱 roothide（iOS 17.0 SDK 构建） | `ChargeLimiter_<版本>_roothide_ios17_arm64e.deb` | iphoneos-arm64e |
+| 越狱 roothide（iOS 16.5 SDK 构建） | `packages/ios16/com.chargelimiter.mod_<版本>_ios16_iphoneos-arm64e.deb` | iphoneos-arm64e |
+| 越狱 roothide（iOS 17.0 SDK 构建） | `packages/ios17/com.chargelimiter.mod_<版本>_ios17_iphoneos-arm64e.deb` | iphoneos-arm64e |
 
 * 下载：<https://github.com/tunecc/ChargeLimiter/releases>
 * 历史的 tipa / rootful / rootless 产物自 v1.17.5 工程迁移起不再发布，旧版本可在 Releases 页下载
@@ -413,7 +413,7 @@ curl http://127.0.0.1:1230 -d '{"api":"get_conf","key":"enable"}' -H "content-ty
 快速命令（Theos roothide 工程）：
 
 ```bash
-./build.sh                    # ios16 + ios17 双 SDK 构建 + 包检查，输出到 out/
+./build.sh                    # ios16 + ios17 双 SDK 构建 + 包检查，输出到 packages/
 ./build.sh --target ios16     # 单目标构建
 THEOS=/path/to/theos-roothide ./build.sh   # 指定 Theos 路径
 ```
@@ -866,12 +866,12 @@ A few internal/bookkeeping keys with no UI exposure are omitted here: `temp_mode
 
 ## Packages and download
 
-The build script produces two roothide release packages (written to `out/`):
+The build script produces two roothide release packages (written to `packages/<label>/`, only the latest build is kept locally):
 
 | Environment | Artifact | Architecture |
 | --- | --- | --- |
-| roothide jailbreak (iOS 16.5 SDK build) | `ChargeLimiter_<version>_roothide_ios16_arm64e.deb` | iphoneos-arm64e |
-| roothide jailbreak (iOS 17.0 SDK build) | `ChargeLimiter_<version>_roothide_ios17_arm64e.deb` | iphoneos-arm64e |
+| roothide jailbreak (iOS 16.5 SDK build) | `packages/ios16/com.chargelimiter.mod_<version>_ios16_iphoneos-arm64e.deb` | iphoneos-arm64e |
+| roothide jailbreak (iOS 17.0 SDK build) | `packages/ios17/com.chargelimiter.mod_<version>_ios17_iphoneos-arm64e.deb` | iphoneos-arm64e |
 
 * Download: <https://github.com/tunecc/ChargeLimiter/releases>
 * The legacy tipa / rootful / rootless artifacts are no longer shipped since the v1.17.5 project migration; older versions remain on the Releases page
@@ -884,7 +884,7 @@ See [构建安装包.md](构建安装包.md) for details.
 Quick commands (Theos roothide project):
 
 ```bash
-./build.sh                    # dual-SDK build (ios16 + ios17) with package checks, output to out/
+./build.sh                    # dual-SDK build (ios16 + ios17) with package checks, output to packages/
 ./build.sh --target ios16     # single-target build
 THEOS=/path/to/theos-roothide ./build.sh   # explicit Theos path
 ```

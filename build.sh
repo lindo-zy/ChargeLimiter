@@ -3,15 +3,18 @@
 #
 # 用法：
 #   ./build.sh --help
-#   ./build.sh                       # ios16 + ios17 双目标构建 + 包检查，输出到 out/
+#   ./build.sh                       # ios16 + ios17 双目标构建 + 包检查，输出到 packages/
 #   ./build.sh --target ios16        # 单目标构建
 #
 # 规则：
 #   - 只做 RootHide 包：THEOS_PACKAGE_SCHEME=roothide，Architecture iphoneos-arm64e。
 #     不再产出 TrollStore tipa / rootful / rootless。
-#   - 产物统一 out/ChargeLimiter_<ver>_roothide_<label>_arm64e.deb（label = ios16/ios17）。
+#   - 产物统一 packages/<label>/（ios16 / ios17，与 Metis 同款），命名
+#     com.chargelimiter.mod_<ver>_<label>_iphoneos-arm64e.deb——版本在文件名里区分。
+#   - 本地目录只保留最新一次构建：每次构建前清空对应 label 目录的旧 deb，
+#     不保留历史版本（历史版本走 GitHub Releases）。
 #   - 版本单一来源 = control；Info.plist 短版本必须与之一致，不一致直接报错。
-#   - 构建进程级锁：同一时刻只允许一个 build.sh 写 packages/ 与 out/。
+#   - 构建进程级锁：同一时刻只允许一个 build.sh 写 packages/。
 
 set -euo pipefail
 
@@ -85,8 +88,8 @@ if [[ "$PLIST_VERSION" != "$CONTROL_VERSION" ]]; then
 fi
 
 # ---- 进程级锁 ----
-mkdir -p "$ROOT_DIR/out"
-LOCK_DIR="$ROOT_DIR/out/.build-lock"
+mkdir -p "$ROOT_DIR/packages"
+LOCK_DIR="$ROOT_DIR/packages/.build-lock"
 if [[ -e "$LOCK_DIR" ]] || ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "error: another build is in progress (lock: $LOCK_DIR)" >&2
     exit 1
@@ -256,11 +259,15 @@ build_one() {
         exit 1
     fi
 
-    mkdir -p "$ROOT_DIR/out"
-    local out_path="$ROOT_DIR/out/ChargeLimiter_${CONTROL_VERSION}_roothide_${label}_arm64e.deb"
-    mv "$package_path" "$out_path"
-    check_deb "$out_path"
-    echo "==> Output: $out_path"
+    # 产物落 packages/<label>/（Metis 同款）：版本在文件名里区分；
+    # 先清空该 label 目录旧 deb——本地只保留最新一次构建
+    local output_dir="$ROOT_DIR/packages/$label"
+    local output_path="$output_dir/${PACKAGE_ID}_${CONTROL_VERSION}_${label}_iphoneos-arm64e.deb"
+    mkdir -p "$output_dir"
+    find "$output_dir" -maxdepth 1 -type f -name '*.deb' -delete 2>/dev/null || true
+    mv "$package_path" "$output_path"
+    check_deb "$output_path"
+    echo "==> Output: $output_path"
 }
 
 case "$BUILD_TARGET" in
