@@ -2,7 +2,7 @@
 //
 // 宿主/让位/挂载模式参考本地 Metis 工程 Modules/Charging（CSCoverSheetViewController
 // hook 套装 + 窗口层挂载 + 通知栈让位 + 密码页摘卡），内容换血为「当前充电策略」：
-// hero 策略动作 + 电量环（目标刻度）+ 参数网格 + 恢复条件 + 锁屏启动临时充满按钮。
+// 电池侧功率和达标余时 + 电量环（目标刻度）+ 参数网格 + 策略状态和临时充满按钮。
 //
 // 数据通路（零网络、零 App 依赖）：
 //   读 —— jbroot("var/mobile/ChargeLimiter/saver_state.plist") 镜像：daemon root 写、
@@ -31,6 +31,7 @@
 #import <substrate.h>
 #import <libroot/libroot.h>
 #import <mach-o/dyld.h>
+#import "CLSaverBattery.h"
 #include <math.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -148,9 +149,27 @@ static BOOL CLSaverBoolOrMissing(id object, NSString *name, BOOL missingValue) {
 
 #pragma mark - 策略文案映射（与 App CLHistoryPolicyStateLabel 同源语义）
 
+static BOOL CLSaverScheduledFull(NSDictionary *mirror) {
+    return [mirror[@"full_charge_window_active"] boolValue] || [mirror[@"policy_reason"] isEqual:@"full_charge_window"];
+}
+
+static NSInteger CLSaverConfiguredLimit(NSDictionary *mirror) {
+    NSNumber *limit = mirror[@"charge_above"];
+    return [limit isKindOfClass:NSNumber.class] ? MAX(1, MIN(100, limit.integerValue)) : 100;
+}
+
+static NSInteger CLSaverTargetPercent(NSDictionary *mirror) {
+    return [mirror[@"temp_full_charge_active"] boolValue] || CLSaverScheduledFull(mirror)
+        ? 100 : CLSaverConfiguredLimit(mirror);
+}
+
+static BOOL CLSaverPolicyAllowsCharging(NSDictionary *mirror) {
+    id state = mirror[@"policy_state"];
+    return [state isEqual:@"charging"] || [state isEqual:@"hold_recharge"];
+}
+
 @interface CLSaverStrategy : NSObject
-@property (nonatomic, copy) NSString *heroTitle;      // 大字策略动作
-@property (nonatomic, copy) NSString *heroSubtitle;   // 「当前策略 · …」
+@property (nonatomic, copy) NSString *title;          // 参数格中的当前策略
 @property (nonatomic, copy) NSString *badgeTitle;     // 底部胶囊
 @property (nonatomic, copy) NSString *recoveryNote;   // 底部恢复条件（右对齐）
 @property (nonatomic, assign) BOOL warning;           // 停充/临时充满 → 橙色系
@@ -160,45 +179,41 @@ static BOOL CLSaverBoolOrMissing(id object, NSString *name, BOOL missingValue) {
 
 static CLSaverStrategy *CLSaverStrategyForMirror(NSDictionary *mirror) {
     CLSaverStrategy *s = [CLSaverStrategy new];
-    NSString *state = [mirror isKindOfClass:[NSDictionary class]] ? (mirror[@"policy_state"] ?: @"battery") : @"battery";
-    BOOL tempFull = mirror[@"temp_full_charge_active"] ? [mirror[@"temp_full_charge_active"] boolValue] : NO;
-    NSInteger above = mirror[@"charge_above"] ? [mirror[@"charge_above"] integerValue] : 100;
+    id state = mirror[@"policy_state"];
+    id reason = mirror[@"policy_reason"];
+    NSInteger above = CLSaverConfiguredLimit(mirror);
     NSInteger below = mirror[@"charge_below"] ? [mirror[@"charge_below"] integerValue] : 20;
-    if (tempFull) {
-        s.heroTitle = @"临时充满中";
-        s.heroSubtitle = @"当前策略 · 上限已临时解除";
+    if ([state isEqual:@"temp_paused"] || [reason isEqual:@"temperature_high"]) {
+        float tempBelow = mirror[@"charge_temp_below"] ? [mirror[@"charge_temp_below"] floatValue] : 35.0;
+        s.title = @"温度达上限";
+        s.badgeTitle = @"温控暂停";
+        s.recoveryNote = [NSString stringWithFormat:@"温度 ≤ %.0f° 恢复充电", tempBelow];
+        s.warning = YES;
+    } else if ([mirror[@"temp_full_charge_active"] boolValue]) {
+        s.title = @"临时满充";
         s.badgeTitle = @"临时充满中";
         s.recoveryNote = [NSString stringWithFormat:@"充满后自动恢复 %ld%%", (long)above];
         s.warning = YES;
-        return s;
-    }
-    if ([state isEqualToString:@"charging"]) {
-        s.heroTitle = @"正在充电";
-        s.heroSubtitle = @"当前策略 · 插电即充";
+    } else if (CLSaverScheduledFull(mirror)) {
+        s.title = @"满充计划";
+        s.badgeTitle = [state isEqual:@"charging"] ? @"正在充电" : @"未充电";
+        s.recoveryNote = [NSString stringWithFormat:@"计划结束后恢复 %ld%%", (long)above];
+    } else if ([state isEqual:@"charging"]) {
+        s.title = @"插电即充";
         s.badgeTitle = @"正在充电";
         s.recoveryNote = [NSString stringWithFormat:@"到 %ld%% 自动停充", (long)above];
-    } else if ([state isEqualToString:@"temp_paused"]) {
-        float tempBelow = mirror[@"charge_temp_below"] ? [mirror[@"charge_temp_below"] floatValue] : 35.0;
-        s.heroTitle = @"温控暂停";
-        s.heroSubtitle = @"当前策略 · 温度达到上限";
-        s.badgeTitle = @"温控暂停";
-        s.recoveryNote = [NSString stringWithFormat:@"温度 ≤%.0f° 恢复充电", tempBelow];
-        s.warning = YES;
-    } else if ([state isEqualToString:@"hold"] || [state isEqualToString:@"hold_recharge"]) {
+    } else if ([state isEqual:@"hold"] || [state isEqual:@"hold_recharge"]) {
         NSInteger lower = mirror[@"hold_lower"] ? [mirror[@"hold_lower"] integerValue] : (above - 5);
-        s.heroTitle = @"插电保持";
-        s.heroSubtitle = @"当前策略 · 插电保持";
-        s.badgeTitle = @"插电保持";
+        s.title = @"插电保持";
+        s.badgeTitle = [state isEqual:@"hold_recharge"] ? @"正在补电" : @"插电保持";
         s.recoveryNote = [NSString stringWithFormat:@"保持区间 %ld–%ld%%", (long)lower, (long)above];
-    } else if ([state isEqualToString:@"stopped"] || [state isEqualToString:@"no_inflow"]) {
-        s.heroTitle = @"已停充";
-        s.heroSubtitle = @"当前策略 · 达到电量上限";
+    } else if ([state isEqual:@"stopped"] || [state isEqual:@"no_inflow"]) {
+        s.title = [reason isEqual:@"capacity_high"] ? @"达到电量上限" : @"等待恢复";
         s.badgeTitle = @"已停充";
         s.recoveryNote = [NSString stringWithFormat:@"低于 %ld%% 自动恢复充电", (long)below];
         s.warning = YES;
     } else {
-        s.heroTitle = @"未充电";
-        s.heroSubtitle = @"当前策略 · 等待充电";
+        s.title = @"等待充电";
         s.badgeTitle = @"未充电";
         s.recoveryNote = @"等待充电策略执行";
     }
@@ -224,11 +239,6 @@ static NSInteger CLSaverIntValue(id value, NSInteger fallback) {
     if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value integerValue];
     return fallback;
 }
-static double CLSaverDoubleValue(id value, double fallback) {
-    if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value doubleValue];
-    return fallback;
-}
-
 static BOOL CLSaverHasExternalPower(NSDictionary *battery) {
     if (CLSaverIntValue(battery[@"ExternalConnected"], 0) ||
         CLSaverIntValue(battery[@"ExternalChargeCapable"], 0) ||
@@ -242,18 +252,34 @@ static BOOL CLSaverHasExternalPower(NSDictionary *battery) {
         [description length] > 0 && ![description isEqualToString:@"batt"];
 }
 
-static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight weight, UIColor *color, NSTextAlignment align) {
+static NSDictionary *CLSaverTextAttributes(CGFloat size, UIFontWeight weight, UIColor *color, NSTextAlignment align) {
     NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
     style.alignment = align;
     style.lineBreakMode = NSLineBreakByTruncatingTail;
-    [text drawInRect:rect withAttributes:@{NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:size weight:weight],
-        NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}];
+    return @{NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:size weight:weight],
+             NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style};
+}
+
+static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight weight, UIColor *color, NSTextAlignment align) {
+    [text drawInRect:rect withAttributes:CLSaverTextAttributes(size, weight, color, align)];
+}
+
+static NSAttributedString *CLSaverReading(double value, NSString *format, NSString *unit,
+                                          CGFloat numberSize, CGFloat unitSize, UIColor *unitColor) {
+    NSString *number = isfinite(value) ? [NSString stringWithFormat:format, value] : @"—";
+    NSMutableAttributedString *reading = [[NSMutableAttributedString alloc] initWithString:number
+        attributes:CLSaverTextAttributes(numberSize, UIFontWeightSemibold, UIColor.whiteColor, NSTextAlignmentLeft)];
+    if (isfinite(value) && unit.length) {
+        [reading appendAttributedString:[[NSAttributedString alloc] initWithString:unit
+            attributes:CLSaverTextAttributes(unitSize, UIFontWeightMedium, unitColor, NSTextAlignmentLeft)]];
+    }
+    return reading;
 }
 
 @interface CLSaverCardInk : UIView
 @property (nonatomic, strong) NSDictionary *mirror;
-@property (nonatomic, strong) NSDictionary *battery;
-@property (nonatomic, assign) BOOL confirming;
+@property (nonatomic, assign) CLSaverBatteryMetrics battery;
+@property (nonatomic, assign) NSInteger minutesToTarget;
 @end
 
 @implementation CLSaverCardInk
@@ -264,46 +290,50 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     CGContextSaveGState(context);
     CGContextScaleCTM(context, self.bounds.size.width / CLSaverCardDesignWidth, self.bounds.size.height / CLSaverCardDesignHeight);
     UIColor *white = UIColor.whiteColor;
-    UIColor *muted = [white colorWithAlphaComponent:0.64];
-    UIColor *dim = [white colorWithAlphaComponent:0.35];
+    UIColor *muted = [white colorWithAlphaComponent:0.67];
     CLSaverStrategy *strategy = CLSaverStrategyForMirror(mirror);
     UIColor *accent = strategy.warning ? CLSaverOrange() : CLSaverGreen();
 
-    BOOL tempFull = mirror[@"temp_full_charge_active"] ? [mirror[@"temp_full_charge_active"] boolValue] : NO;
-    NSInteger above = mirror[@"charge_above"] ? [mirror[@"charge_above"] integerValue] : 100;
-    NSInteger below = mirror[@"charge_below"] ? [mirror[@"charge_below"] integerValue] : 20;
-    BOOL enableTemp = mirror[@"enable_temp"] ? [mirror[@"enable_temp"] boolValue] : NO;
-    float tempAbove = mirror[@"charge_temp_above"] ? [mirror[@"charge_temp_above"] floatValue] : 40.0;
+    CLSaverBatteryMetrics battery = self.battery;
+    NSInteger target = CLSaverTargetPercent(mirror);
+    NSAttributedString *power = CLSaverReading(battery.watts, @"%.1f", @" W", 37, 18, CLSaverGreen());
+    [power drawAtPoint:CGPointMake(17, 25)];
+    CLSaverText(@"实时功率", CGRectMake(25 + ceil(power.size.width), 49, 65, 19),
+                12, UIFontWeightMedium, muted, NSTextAlignmentLeft);
 
-    int capacity = (int)CLSaverIntValue(self.battery[@"CurrentCapacity"], 0);
-    float temperature = self.battery[@"Temperature"] ? ((float)CLSaverDoubleValue(self.battery[@"Temperature"], NAN) / 100.0) : NAN;
-    double maxCap = CLSaverDoubleValue(self.battery[@"AppleRawMaxCapacity"], NAN);
-    double designCap = CLSaverDoubleValue(self.battery[@"AppleRawDesignCapacity"], NAN);
-    int cycleCount = (int)CLSaverIntValue(self.battery[@"CycleCount"], 0);
+    if (self.minutesToTarget > 0) {
+        NSDictionary *attributes = CLSaverTextAttributes(12, UIFontWeightMedium, muted, NSTextAlignmentLeft);
+        NSMutableAttributedString *eta = [[NSMutableAttributedString alloc] initWithString:@"预计约 " attributes:attributes];
+        NSString *minutes = [NSString stringWithFormat:@"%ld 分钟", (long)self.minutesToTarget];
+        [eta appendAttributedString:[[NSAttributedString alloc] initWithString:minutes
+            attributes:CLSaverTextAttributes(12, UIFontWeightSemibold, white, NSTextAlignmentLeft)]];
+        [eta appendAttributedString:[[NSAttributedString alloc] initWithString:target == 100 ? @"充满" : @"达标"
+            attributes:attributes]];
+        [eta drawAtPoint:CGPointMake(18, 82)];
+    } else if (CLSaverPolicyAllowsCharging(mirror) && battery.charging && !(battery.levelPercent >= target)) {
+        CLSaverText(@"正在估算充电时间…", CGRectMake(18, 82, 202, 19),
+                    12, UIFontWeightMedium, muted, NSTextAlignmentLeft);
+    }
 
-    CLSaverText(strategy.heroTitle, CGRectMake(17, 17, 242, 42), 30, UIFontWeightSemibold, white, NSTextAlignmentLeft);
-    CLSaverText(strategy.heroSubtitle, CGRectMake(18, 61, 242, 17), 11, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
-
-    // 电量环：填充 = 电量比例；目标刻度 = 停充上限（临时充满时 100%）
-    CGFloat ringTarget = tempFull ? 100.0 : (CGFloat)above;
-    BOOL targetReached = capacity >= ringTarget;
-    CGPoint center = CGPointMake(294, 49);
-    CGFloat radius = 27;
+    // 保留原本的电量环、目标刻度与达标时的白色刻度。
+    BOOL targetReached = battery.levelPercent >= target;
+    CGPoint center = CGPointMake(285, 48);
+    CGFloat radius = 32;
     UIBezierPath *track = [UIBezierPath bezierPathWithArcCenter:center radius:radius startAngle:-M_PI_2 endAngle:M_PI * 1.5 clockwise:YES];
-    track.lineWidth = 4.5;
-    [[white colorWithAlphaComponent:0.13] setStroke];
+    track.lineWidth = 5.5;
+    [[white colorWithAlphaComponent:0.18] setStroke];
     [track stroke];
-    if (capacity > 0) {
-        CGFloat fraction = MIN(capacity / 100.0, 1.0);
+    if (battery.levelPercent > 0) {
+        CGFloat fraction = MIN(battery.levelPercent / 100.0, 1.0);
         UIBezierPath *ring = [UIBezierPath bezierPathWithArcCenter:center radius:radius startAngle:-M_PI_2
                                                              endAngle:-M_PI_2 + M_PI * 2 * fraction clockwise:YES];
-        ring.lineWidth = 4.5;
+        ring.lineWidth = track.lineWidth;
         ring.lineCapStyle = kCGLineCapRound;
         [accent setStroke];
         [ring stroke];
     }
     // 目标刻度线：到达后用白色（与弧末端重合仍可辨），未到用目标色
-    CGFloat tickAngle = -M_PI_2 + M_PI * 2 * (ringTarget / 100.0);
+    CGFloat tickAngle = -M_PI_2 + M_PI * 2 * (target / 100.0);
     CGPoint tickOuter = CGPointMake(center.x + cosf(tickAngle) * (radius + 3.5), center.y + sinf(tickAngle) * (radius + 3.5));
     CGPoint tickInner = CGPointMake(center.x + cosf(tickAngle) * (radius - 3.5), center.y + sinf(tickAngle) * (radius - 3.5));
     UIBezierPath *tick = [UIBezierPath bezierPath];
@@ -313,58 +343,62 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     tick.lineCapStyle = kCGLineCapRound;
     [targetReached ? UIColor.whiteColor : accent setStroke];
     [tick stroke];
-    CLSaverText([NSString stringWithFormat:@"%d%%", capacity], CGRectMake(264, 39, 60, 22), 15, UIFontWeightBold, white, NSTextAlignmentCenter);
-    CLSaverText([NSString stringWithFormat:@"目标 %ld%%", (long)ringTarget], CGRectMake(256, 85, 76, 15), 10, UIFontWeightSemibold, muted, NSTextAlignmentCenter);
+    NSString *percent = isfinite(battery.levelPercent) ? [NSString stringWithFormat:@"%.0f%%", battery.levelPercent] : @"—";
+    CLSaverText(percent, CGRectMake(250, 35, 70, 29), 21, UIFontWeightBold, white, NSTextAlignmentCenter);
+    CLSaverText([NSString stringWithFormat:@"目标 %ld%%", (long)target], CGRectMake(247, 89, 76, 17),
+                11, UIFontWeightSemibold, muted, NSTextAlignmentCenter);
 
-    [[white colorWithAlphaComponent:0.1] setStroke];
+    CGRect grid = CGRectMake(16, 115, 312, 118);
+    CGFloat columnWidth = CGRectGetWidth(grid) / 3;
+    CGFloat rowHeight = CGRectGetHeight(grid) / 2;
+    UIBezierPath *gridOutline = [UIBezierPath bezierPathWithRoundedRect:grid cornerRadius:14];
+    [[white colorWithAlphaComponent:0.035] setFill];
+    [gridOutline fill];
+    [[white colorWithAlphaComponent:0.09] setStroke];
+    gridOutline.lineWidth = 0.75;
+    [gridOutline stroke];
     UIBezierPath *dividers = [UIBezierPath bezierPath];
-    [dividers moveToPoint:CGPointMake(17, 112)];
-    [dividers addLineToPoint:CGPointMake(327, 112)];
-    [dividers moveToPoint:CGPointMake(17, 169)];
-    [dividers addLineToPoint:CGPointMake(327, 169)];
-    for (NSNumber *x in @[@120, @223]) {
-        [dividers moveToPoint:CGPointMake(x.doubleValue, 112)];
-        [dividers addLineToPoint:CGPointMake(x.doubleValue, 230)];
+    [dividers moveToPoint:CGPointMake(CGRectGetMinX(grid), CGRectGetMidY(grid))];
+    [dividers addLineToPoint:CGPointMake(CGRectGetMaxX(grid), CGRectGetMidY(grid))];
+    for (NSUInteger column = 1; column < 3; column++) {
+        CGFloat x = CGRectGetMinX(grid) + columnWidth * column;
+        [dividers moveToPoint:CGPointMake(x, CGRectGetMinY(grid))];
+        [dividers addLineToPoint:CGPointMake(x, CGRectGetMaxY(grid))];
     }
-    dividers.lineWidth = 0.35;
+    dividers.lineWidth = gridOutline.lineWidth;
     [dividers stroke];
 
-    NSArray *rowTitles = @[@"停充上限", @"开始充电", @"电池温度", @"温度控制", @"临时充满", @"电池健康"];
-    NSString *tempText = isfinite(temperature) ? [NSString stringWithFormat:@"%.1f°C", temperature] : @"—";
-    NSString *healthText = (isfinite(maxCap) && isfinite(designCap) && designCap > 0)
-        ? [NSString stringWithFormat:@"%.0f%%", maxCap * 100.0 / designCap] : (cycleCount > 0 ? [NSString stringWithFormat:@"%ld 次", (long)cycleCount] : @"—");
-    NSString *tempFullText = tempFull ? @"激活中" : (self.confirming ? @"确认中…" : @"未启用");
-    NSArray *rowValues = @[
-        [NSString stringWithFormat:@"%ld%%", (long)above],
-        [NSString stringWithFormat:@"%ld%%", (long)below],
-        tempText,
-        enableTemp ? [NSString stringWithFormat:@"开 · %.0f°", tempAbove] : @"关",
-        tempFullText,
-        healthText,
+    NSArray<NSString *> *titles = @[@"实时容量", @"最大容量", @"当前策略", @"当前电池温度", @"健康度", @"循环次数"];
+    NSArray<NSAttributedString *> *values = @[
+        CLSaverReading(battery.currentMilliampHours, @"%.0f", @" mAh", 18, 10, muted),
+        CLSaverReading(battery.maximumMilliampHours, @"%.0f", @" mAh", 18, 10, muted),
+        [[NSAttributedString alloc] initWithString:strategy.title
+            attributes:CLSaverTextAttributes(14, UIFontWeightSemibold, white, NSTextAlignmentLeft)],
+        CLSaverReading(battery.celsius, @"%.1f", @" °C", 19, 11, muted),
+        CLSaverReading(battery.healthPercent, @"%.0f", @"%", 19, 11, muted),
+        CLSaverReading(battery.cycleCount, @"%.0f", @" 次", 19, 11, muted),
     ];
-    for (NSUInteger i = 0; i < 6; i++) {
-        CGFloat x = (i % 3) == 0 ? 18 : ((i % 3) == 1 ? 133 : 236);
-        CGFloat y = i < 3 ? 122 : 179;
-        CLSaverText(rowTitles[i], CGRectMake(x, y, 86, 15), 10, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
-        UIColor *valueColor = white;
-        if ([rowTitles[i] isEqualToString:@"临时充满"]) valueColor = (tempFull || self.confirming) ? CLSaverOrange() : dim;
-        CLSaverText(rowValues[i], CGRectMake(x, y + 17, 92, 21), 15, UIFontWeightSemibold, valueColor, NSTextAlignmentLeft);
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        CGFloat x = CGRectGetMinX(grid) + columnWidth * (i % 3) + 10;
+        CGFloat y = CGRectGetMinY(grid) + rowHeight * (i / 3);
+        CLSaverText(titles[i], CGRectMake(x, y + 8, columnWidth - 20, 17), 11, UIFontWeightMedium, muted, NSTextAlignmentLeft);
+        NSAttributedString *value = values[i];
+        [value drawInRect:CGRectMake(x, y + 40 - value.size.height / 2, columnWidth - 20, ceil(value.size.height))];
     }
 
     // 底部状态胶囊 + 恢复条件
     CGFloat badgeWidth = strategy.badgeTitle.length > 4 ? 80 : 69;
-    CGRect badge = CGRectMake(17, 234, badgeWidth, 24);
+    CGRect badge = CGRectMake(16, 243, badgeWidth, 24);
     [[accent colorWithAlphaComponent:0.14] setFill];
     [[UIBezierPath bezierPathWithRoundedRect:badge cornerRadius:11] fill];
     CLSaverText(strategy.badgeTitle, CGRectInset(badge, 4, 5), 11, UIFontWeightSemibold, accent, NSTextAlignmentCenter);
-    CLSaverText(strategy.recoveryNote, CGRectMake(104, 239, 223, 17), 11, UIFontWeightMedium, muted, NSTextAlignmentRight);
+    CLSaverText(strategy.recoveryNote, CGRectMake(104, 248, 224, 17), 11, UIFontWeightMedium, muted, NSTextAlignmentRight);
     CGContextRestoreGState(context);
 }
 @end
 
 @interface CLSaverCTAView : UIView
 @property (nonatomic, assign) CLSaverButtonState ctaState;
-@property (nonatomic, copy) NSString *readyTitle;
 @property (nonatomic, assign) CGFloat confirmProgress; // 0..1 确认倒计时进度
 @property (nonatomic, copy) void (^onTap)(CLSaverButtonState currentState);
 @end
@@ -401,9 +435,8 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     UIColor *color = green;
     UIColor *border = [green colorWithAlphaComponent:0.35];
     UIColor *fill = [green colorWithAlphaComponent:0.10];
-    BOOL showsBolt = self.ctaState == CLSaverButtonReady;
-    if (showsBolt) {
-        text = self.readyTitle ?: @"启动临时充满";
+    if (self.ctaState == CLSaverButtonReady) {
+        text = @"临时充满一次";
     } else if (self.ctaState == CLSaverButtonConfirming) {
         text = [NSString stringWithFormat:@"再点一次确认 · %.0f 秒内生效", CLSaverConfirmWindowSeconds];
         color = orange;
@@ -431,24 +464,10 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     [fill setFill];
     UIRectFill(bounds);
 
-    CGFloat scale = bounds.size.width / (CLSaverCardDesignWidth - 34.0);
+    CGFloat scale = bounds.size.width / (CLSaverCardDesignWidth - 32.0);
     UIFont *font = [UIFont systemFontOfSize:14 * scale weight:UIFontWeightSemibold];
-    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
-    style.alignment = NSTextAlignmentCenter;
-    style.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    NSDictionary *attributes = @{NSFontAttributeName: font, NSForegroundColorAttributeName: color,
-                                 NSParagraphStyleAttributeName: style};
-    UIImage *bolt = showsBolt ? [UIImage systemImageNamed:@"bolt.fill"
-        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * scale weight:UIImageSymbolWeightSemibold]] : nil;
-    CGFloat iconSpace = bolt ? bolt.size.width + 7 * scale : 0;
-    CGFloat textWidth = MIN(ceil([text sizeWithAttributes:attributes].width), bounds.size.width - 16 - iconSpace);
-    CGFloat leading = (bounds.size.width - iconSpace - textWidth) / 2;
-    if (bolt) {
-        UIImage *icon = [bolt imageWithTintColor:UIColor.systemYellowColor renderingMode:UIImageRenderingModeAlwaysOriginal];
-        [icon drawAtPoint:CGPointMake(leading, (bounds.size.height - icon.size.height) / 2)];
-    }
-    [text drawInRect:CGRectMake(leading + iconSpace, (bounds.size.height - font.lineHeight) / 2, textWidth, ceil(font.lineHeight))
-       withAttributes:attributes];
+    CLSaverText(text, CGRectMake(8, (bounds.size.height - font.lineHeight) / 2, bounds.size.width - 16, ceil(font.lineHeight)),
+                font.pointSize, UIFontWeightSemibold, color, NSTextAlignmentCenter);
     if (self.ctaState == CLSaverButtonConfirming) {
         // 确认倒计时进度条（底边）
         CGFloat progressWidth = bounds.size.width * MAX(0, MIN(self.confirmProgress, 1.0));
@@ -472,7 +491,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         self.clipsToBounds = YES;
         self.layer.borderWidth = 0.5;
         self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
-        self.backgroundColor = [UIColor colorWithRed:0.075 green:0.072 blue:0.095 alpha:0.88];
+        self.backgroundColor = [UIColor colorWithRed:0.08 green:0.106 blue:0.13 alpha:0.92];
         self.ink = [[CLSaverCardInk alloc] initWithFrame:self.bounds];
         self.ink.backgroundColor = UIColor.clearColor;
         self.ink.contentMode = UIViewContentModeRedraw;
@@ -496,7 +515,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     [super layoutSubviews];
     CGFloat scale = self.bounds.size.width / CLSaverCardDesignWidth;
     self.ink.frame = self.bounds;
-    CGFloat ctaX = 17.0 * scale;
+    CGFloat ctaX = 16.0 * scale;
     CGFloat ctaHeight = 44.0 * scale;
     self.cta.frame = CGRectMake(ctaX, self.bounds.size.height - ctaHeight - 15.0 * scale,
                                 self.bounds.size.width - ctaX * 2, ctaHeight);
@@ -513,6 +532,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 @property (nonatomic, strong) NSTimer *confirmTimer;
 @property (nonatomic, assign) NSTimeInterval confirmDeadline;
 @property (nonatomic, strong) dispatch_queue_t samplingQueue;
+@property (nonatomic, strong) CLSaverChargeEstimator *chargeEstimator;
 @property (nonatomic, strong) NSDictionary *mirror;              // saver_state.plist 内容
 @property (nonatomic, assign) BOOL appeared;
 @property (nonatomic, assign) BOOL displayOn;
@@ -548,6 +568,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
 - (instancetype)init {
     if ((self = [super init])) {
         _samplingQueue = dispatch_queue_create("com.chargelimiter.saver", DISPATCH_QUEUE_SERIAL);
+        _chargeEstimator = [CLSaverChargeEstimator new];
         _displayOn = YES; _displayToken = -1; _lockToken = -1; _mirrorToken = -1;
         __weak typeof(self) weakSelf = self;
         if (notify_register_dispatch("com.apple.iokit.hid.displayStatus", &_displayToken, dispatch_get_main_queue(), ^(int token) {
@@ -589,7 +610,11 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     }
     NSString *path = [jbRoot stringByAppendingPathComponent:@"var/mobile/ChargeLimiter/saver_state.plist"];
     NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
-    self.mirror = [dict isKindOfClass:[NSDictionary class]] ? dict : nil;
+    NSDictionary *mirror = [dict isKindOfClass:[NSDictionary class]] ? dict : nil;
+    if (CLSaverTargetPercent(self.mirror) != CLSaverTargetPercent(mirror) || !CLSaverPolicyAllowsCharging(mirror)) {
+        [self.chargeEstimator reset];
+    }
+    self.mirror = mirror;
     BOOL exists = self.mirror != nil;
     BOOL daemonEnable = self.mirror[@"daemon_enable"] ? [self.mirror[@"daemon_enable"] boolValue] : NO;
     BOOL saverEnable = self.mirror[@"saver_enabled"] ? [self.mirror[@"saver_enabled"] boolValue] : NO;
@@ -706,6 +731,8 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     NSUInteger generation = self.generation;
     dispatch_async(self.samplingQueue, ^{
         NSDictionary *battery = CLSaverReadBattery();
+        CLSaverBatteryMetrics metrics = CLSaverBatteryMetricsFromProperties(battery);
+        NSTimeInterval sampleTime = NSProcessInfo.processInfo.systemUptime;
         dispatch_async(dispatch_get_main_queue(), ^{
             self.sampling = NO;
             if (generation != self.generation || ![self canShow]) return;
@@ -720,6 +747,12 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
             }
             // 充电屏保只在「已连接外部电源」的充电会话内显示；拔电即收卡
             if (!externalConnected) { [self stop]; return; }
+            if (CLSaverPolicyAllowsCharging(self.mirror)) {
+                [self.chargeEstimator updateWithBattery:metrics targetPercent:CLSaverTargetPercent(self.mirror)
+                                                atTime:sampleTime];
+            } else {
+                [self.chargeEstimator reset];
+            }
             [self ensureTimer];
             if (!self.card) {
                 self.card = [[CLSaverCardView alloc] initWithFrame:CGRectZero];
@@ -733,7 +766,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
                 [anchor addSubview:self.card];
                 CLSaverLog(@"state=card-attached anchor=%@", NSStringFromClass(anchor.class));
             }
-            self.card.ink.battery = battery;
+            self.card.ink.battery = metrics;
             [self layout];
             [self refreshCardContent];
         });
@@ -756,14 +789,9 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
     if (state != CLSaverButtonConfirming && self.confirmTimer) [self stopConfirmCountdown];
 
     self.card.ink.mirror = self.mirror;
-    self.card.ink.confirming = state == CLSaverButtonConfirming;
+    self.card.ink.minutesToTarget = self.chargeEstimator.minutesToTarget;
     [self.card.ink setNeedsDisplay];
 
-    NSInteger limit = CLSaverIntValue(self.mirror[@"charge_above"], 100);
-    BOOL atLimit = [self.mirror[@"policy_reason"] isEqual:@"capacity_high"];
-    self.card.cta.readyTitle = atLimit
-        ? @"启动临时充满 · 解除上限继续充电"
-        : [NSString stringWithFormat:@"启动临时充满 · 充满后自动恢复 %ld%%", (long)limit];
     self.card.cta.ctaState = state;
     [self.card.cta setNeedsDisplay];
 }
@@ -926,6 +954,7 @@ static CGFloat CLSaverCoverSheetNotificationTopY(UIViewController *host) {
         CLSaverLog(@"state=card-removed");
     }
     self.generation++;
+    [self.chargeEstimator reset];
     [self stopConfirmCountdown];
     [self.timer invalidate];
     self.timer = nil;

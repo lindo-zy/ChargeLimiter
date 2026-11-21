@@ -4570,6 +4570,7 @@ static void refreshSaverStateMirror(void) {
         @"charge_temp_above": @(getLocalFloat(@"charge_temp_above", 40)),
         @"charge_temp_below": @(getLocalFloat(@"charge_temp_below", 35)),
         @"temp_full_charge_active": @(getLocalBool(@"temp_full_charge_once", NO)),
+        @"full_charge_window_active": @(g_fullChargeWindowActive),
         @"hold_enabled": @(isHoldModeEnabled()),
         @"hold_band": @(getHoldModeBand()),
         @"hold_lower": @(getHoldModeLowerBound(above)),
