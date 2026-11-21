@@ -1,9 +1,10 @@
 Package: com.chargelimiter.mod
 Name: Modified ChargeLimiter
 Version: 1.17.9
-Description: 优化了一下界面
+Description: 修复锁屏充电屏保在部分 RootHide 环境里不显示的问题，并调整设置和锁屏两处「临时充满一次」的界面
+Icon: https://raw.githubusercontent.com/lindo-zy/ChargeLimiter/main/ChargeLimiter/AppIcon60x60@3x.png
 Section: Applications
-Depends: firmware (>= 13.0)
+Depends: firmware (>= 15.0)
 Priority: optional
 Architecture: iphoneos-arm64e
 Author: tune

@@ -16,6 +16,8 @@
 #   - 本地目录只保留最新一次构建：每次构建前清空对应 label 目录的旧 deb，
 #     不保留历史版本（历史版本走 GitHub Releases）。
 #   - 版本单一来源 = control；Info.plist 短版本必须与之一致，不一致直接报错。
+#   - 每版简要更新说明（Sileo/Zebra 包页版本号下方一行）用 --note 传入，与版本号
+#     一样全部目标成功才写回 control 的 Description；缺省保持原值。
 #   - 构建进程级锁：同一时刻只允许一个 build.sh 写 packages/。
 
 set -euo pipefail
@@ -69,6 +71,8 @@ usage: ./build.sh [--target ios16|ios17|all] [--version MAJOR.MINOR.PATCH]
   --version  可选覆盖（MAJOR.MINOR.PATCH）。缺省自动递增：PATCH +1（>10 进 MINOR，
              MINOR 不自动进 MAJOR）；全部目标构建成功后才写回 control 与 Info.plist，
              失败不写（保持原版本）。
+  --note     本版简要更新说明（一句话）。全部目标构建成功后写入 control 的
+             Description——Sileo/Zebra 包页版本号下方显示的那一行；缺省保持原值。
 环境变量：
   THEOS=<dir>                 覆盖 Theos 路径（默认 /Users/xiao/dev/theos-roothide）。
 EOF
@@ -77,10 +81,12 @@ EOF
 
 BUILD_TARGET="all"
 BUILD_VERSION=""
+BUILD_NOTE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --target) BUILD_TARGET="${2:-}"; shift 2 ;;
         --version) BUILD_VERSION="${2:-}"; shift 2 ;;
+        --note) BUILD_NOTE="${2:-}"; shift 2 ;;
         --help|-h) usage ;;
         *) echo "error: unknown argument: $1" >&2; usage ;;
     esac
@@ -92,6 +98,13 @@ esac
 if [[ -n "$BUILD_VERSION" ]] && ! [[ "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "error: version must be MAJOR.MINOR.PATCH: $BUILD_VERSION" >&2
     exit 1
+fi
+if [[ -n "$BUILD_NOTE" ]]; then
+    BUILD_NOTE="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$BUILD_NOTE")"
+    if [[ -z "$BUILD_NOTE" || "$BUILD_NOTE" == *$'\n'* || "$BUILD_NOTE" == *$'\r'* ]]; then
+        echo "error: --note must be a single non-empty line" >&2
+        exit 1
+    fi
 fi
 VERSION_TO_BUILD="${BUILD_VERSION:-$(bump_version "$CONTROL_VERSION")}"
 
@@ -118,18 +131,35 @@ if [[ -e "$LOCK_DIR" ]] || ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 
 persist_version() {
-    [[ "$CONTROL_VERSION" == "$VERSION_TO_BUILD" ]] && return 0
+    local version_changed=0
+    if [[ "$CONTROL_VERSION" != "$VERSION_TO_BUILD" ]]; then version_changed=1; fi
+    # 版本与 --note 都没变化时无需写回。
+    if [[ "$version_changed" == 0 && -z "$BUILD_NOTE" ]]; then return 0; fi
     local control_tmp
     control_tmp="$(mktemp "$ROOT_DIR/control.tmp.XXXXXX")" || return 1
-    awk -v next_version="$VERSION_TO_BUILD" '
-        BEGIN { updated = 0 }
-        /^Version:/ { print "Version: " next_version; updated = 1; next }
-        { print }
-        END { if (!updated) exit 1 }
-    ' "$CONTROL_FILE" > "$control_tmp" || { rm -f "$control_tmp"; return 1; }
+    # note 走 ENVIRON 传参：awk -v 会把 \n 等反斜杠序列当转义符展开。
+    VERSION_NEXT="$VERSION_TO_BUILD" VERSION_CHANGED="$version_changed" NOTE="$BUILD_NOTE" \
+        awk '
+            BEGIN { updated = 0 }
+            /^Version:/ {
+                if (ENVIRON["VERSION_CHANGED"] == "1") print "Version: " ENVIRON["VERSION_NEXT"]; else print
+                updated = 1; next
+            }
+            /^Description:/ {
+                if (ENVIRON["NOTE"] != "") print "Description: " ENVIRON["NOTE"]; else print
+                next
+            }
+            { print }
+            END { if (!updated) exit 1 }
+        ' "$CONTROL_FILE" > "$control_tmp" || { rm -f "$control_tmp"; return 1; }
     mv "$control_tmp" "$CONTROL_FILE" || return 1
-    /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString '"$VERSION_TO_BUILD" "$INFO_PLIST" || return 1
-    echo "==> version: ${CONTROL_VERSION} -> ${VERSION_TO_BUILD} (control + Info.plist)"
+    if [[ "$version_changed" == 1 ]]; then
+        /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString '"$VERSION_TO_BUILD" "$INFO_PLIST" || return 1
+        echo "==> version: ${CONTROL_VERSION} -> ${VERSION_TO_BUILD} (control + Info.plist)"
+    fi
+    if [[ -n "$BUILD_NOTE" ]]; then
+        echo "==> description: $BUILD_NOTE"
+    fi
 }
 
 finalize() {
