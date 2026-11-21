@@ -58,6 +58,18 @@ static void CLSaverLog(NSString *format, ...) {
 // 下，截取 "/.jbroot-XXXX" 前缀即可（utils.mm resolveJbRootFromSelfExe 同款模式）。
 // libroot_dyn_jbrootpath 只作兜底：App/daemon 由 roothide launchd 拉起自带解析上下文，
 // 注入进程（SpringBoard）里 libroot 动态解析的可用性没有保证，不能作为唯一通路。
+static NSString *CLSaverJbRootFromImagePath(NSString *path) {
+    if (![path.lastPathComponent isEqualToString:@"CLChargingSaver.dylib"]) return nil;
+    NSRange marker = [path rangeOfString:@"/.jbroot-"];
+    if (marker.location == NSNotFound) return nil;
+
+    NSUInteger identifierStart = NSMaxRange(marker);
+    NSRange componentEnd = [path rangeOfString:@"/" options:0
+                                         range:NSMakeRange(identifierStart, path.length - identifierStart)];
+    if (componentEnd.location == NSNotFound || componentEnd.location == identifierStart) return nil;
+    return [path substringToIndex:componentEnd.location];
+}
+
 static NSString *CLSaverJbRootPath(void) {
     static NSString *cached = nil;
     static dispatch_once_t onceToken;
@@ -66,16 +78,8 @@ static NSString *CLSaverJbRootPath(void) {
         for (uint32_t i = 0; i < count; i++) {
             const char *name = _dyld_get_image_name(i);
             if (!name) continue;
-            NSString *path = [NSString stringWithUTF8String:name];
-            NSRange dot = [path rangeOfString:@"/.jbroot-"];
-            if (dot.location == NSNotFound) continue;
-            if (![path hasSuffix:@"CLChargingSaver.dylib"]) continue;
-            NSString *prefix = [path substringToIndex:dot.location + dot.length];
-            if (prefix.length > 0 && [path length] > prefix.length &&
-                [path characterAtIndex:prefix.length] == '/') {
-                cached = prefix;
-                break;
-            }
+            cached = CLSaverJbRootFromImagePath([NSString stringWithUTF8String:name]);
+            if (cached) break;
         }
         if (cached.length == 0) {
             char resolved[PATH_MAX];
@@ -215,6 +219,19 @@ static NSInteger CLSaverIntValue(id value, NSInteger fallback) {
 static double CLSaverDoubleValue(id value, double fallback) {
     if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value doubleValue];
     return fallback;
+}
+
+static BOOL CLSaverHasExternalPower(NSDictionary *battery) {
+    if (CLSaverIntValue(battery[@"ExternalConnected"], 0) ||
+        CLSaverIntValue(battery[@"ExternalChargeCapable"], 0) ||
+        CLSaverIntValue(battery[@"IsCharging"], 0)) return YES;
+
+    // 禁流时系统可能清零上述字段。沿用 daemon 的适配器判据，排除电池供电标记。
+    id adapter = battery[@"AdapterDetails"];
+    if (![adapter isKindOfClass:[NSDictionary class]]) return NO;
+    id description = adapter[@"Description"];
+    return [description isKindOfClass:[NSString class]] &&
+        [description length] > 0 && ![description isEqualToString:@"batt"];
 }
 
 static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight weight, UIColor *color, NSTextAlignment align) {
@@ -512,6 +529,8 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         }) != NOTIFY_STATUS_OK) _lockToken = -1;
         if (notify_register_dispatch(CLSaverMirrorNotifyName.UTF8String, &_mirrorToken, dispatch_get_main_queue(), ^(int token) {
             [weakSelf reloadMirror];
+            weakSelf.lastProbeTime = 0;
+            [weakSelf refresh];
         }) != NOTIFY_STATUS_OK) _mirrorToken = -1;
         [self reloadMirror];
     }
@@ -656,7 +675,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
         dispatch_async(dispatch_get_main_queue(), ^{
             self.sampling = NO;
             if (generation != self.generation || ![self canShow]) return;
-            BOOL externalConnected = CLSaverIntValue(battery[@"ExternalConnected"], 0) != 0;
+            BOOL externalConnected = CLSaverHasExternalPower(battery);
             BOOL isCharging = CLSaverIntValue(battery[@"IsCharging"], 0) != 0;
             NSString *batteryState = [NSString stringWithFormat:@"connected=%d charging=%d capacity=%d",
                 externalConnected, isCharging,
@@ -666,7 +685,7 @@ static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight 
                 CLSaverLog(@"state=battery %@", batteryState);
             }
             // 充电屏保只在「已连接外部电源」的充电会话内显示；拔电即收卡
-            if (!externalConnected && !isCharging) { [self stop]; return; }
+            if (!externalConnected) { [self stop]; return; }
             [self ensureTimer];
             if (!self.card) {
                 self.card = [[CLSaverCardView alloc] initWithFrame:CGRectZero];
