@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
 #include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
 #import <Foundation/Foundation.h>
 #import <UserNotifications/UserNotifications.h>
 #include <notify.h>
@@ -160,6 +161,12 @@ static const NSTimeInterval kDisableInflowRetryDelaySeconds = 0.6;
 static const NSTimeInterval kPredictiveInhibitFallbackVerifyDelaySeconds = 8.0;
 static NSString* const kDaemonResetAndExitNotifyName = @"com.chargelimiter.mod.daemon.reset_and_exit";
 static NSString* const kDaemonRestoreNotifyName = @"com.chargelimiter.mod.daemon.restore";
+// 充电屏保（CLChargingSaver，SpringBoard tweak）双通道：
+//   saveraction  tweak→daemon，state=1 启动临时充满 / 2 取消（与 thermalapply 同款 notify 命令模式）
+//   policystate  daemon→tweak，saver_state 镜像落盘后广播（tweak 即时重读，1s tick 兜底）
+static NSString* const kSaverActionNotifyName = @"com.chargelimiter.saveraction";
+static NSString* const kSaverStateNotifyName = @"com.chargelimiter.policystate";
+static NSString* const kSaverMirrorFilename = @"saver_state.plist";
 
 // iOS 17 禁流态守卫：禁流态下 ExternalConnected/ExternalChargeCapable 由系统间接派生，息屏周期性刷新会抖动，
 // 不能当插电边沿判据。此函数用语义判定当前是否处于禁流态：用户开关 adv_disable_inflow=YES，或上一轮
@@ -208,6 +215,8 @@ static io_object_t iopmpsNoti = IO_OBJECT_NULL;
 static UPSDataSlim* gUPSPS = nil;
 static int gDaemonResetAndExitNotifyToken = 0;
 static int gDaemonRestoreNotifyToken = 0;
+static int gSaverActionNotifyToken = 0;
+static NSDictionary* g_lastSaverMirrorPayload = nil;
 
 NSDictionary* handleReq(NSDictionary* nsreq);
 static void onBatteryEventEnd(void);
@@ -227,6 +236,10 @@ static void appendPolicyEventHistory(NSString* eventType, NSString* fromState, N
 static void insertPolicyEventDBData(NSDictionary* event);
 static void migrateStoredPolicyEventsToDBIfNeeded(NSArray* history);
 static NSString* policyEventTypeForTransition(NSString* nextPolicyState, NSString* reason);
+// 充电屏保镜像（saver_state.plist）：内容 diff 守卫，可在任意高频路径安全调用
+static void refreshSaverStateMirror(void);
+// 临时充满单发窗口唯一写入口（App set_conf / 屏保按钮 notify / 策略完成共用）
+static void setTempFullChargeOnce(BOOL on, NSString* source);
 static void appendSmartChargeCoordinationEvent(NSString* reason, int fromStatus, int toStatus, NSDictionary* info, NSDictionary* extras, time_t now);
 static void loadSmartChargeCoordinationRuntimeState(void);
 static void tryRestoreSmartChargeAfterCoordination(NSString* reason);
@@ -525,6 +538,8 @@ static void updatePolicyRuntimeState(NSString* nextPolicyState, NSString* reason
     }
     g_policyState = safeState;
     g_policyReason = safeReason;
+    // 每个电池事件的策略提交尾随刷屏保镜像（内容 diff 守卫，无变化零写盘）。
+    refreshSaverStateMirror();
 }
 
 static NSCalendar* fullChargeScheduleCalendar() {
@@ -867,6 +882,43 @@ static void unregisterDaemonRestoreNotifySignal(void) {
     }
     notify_cancel(gDaemonRestoreNotifyToken);
     gDaemonRestoreNotifyToken = 0;
+}
+
+static void handleSaverActionCommand(uint64_t state) {
+    // 屏保按钮命令（state=1 启动 / 2 取消）：与 requestDaemonSmartChargeRestore 同
+    // 模式——notify 回调在主队列执行，电池事件同样跑在主 runloop，天然串行。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (state == 1) {
+            setTempFullChargeOnce(YES, @"saver_button");
+            refreshBatteryStateAndApplyPolicy();
+        } else if (state == 2) {
+            setTempFullChargeOnce(NO, @"saver_button");
+            refreshBatteryStateAndApplyPolicy();
+        }
+    });
+}
+
+static void registerSaverActionNotifySignal(void) {
+    if (gSaverActionNotifyToken != 0) {
+        return;
+    }
+    notify_register_dispatch(kSaverActionNotifyName.UTF8String,
+                             &gSaverActionNotifyToken,
+                             dispatch_get_main_queue(),
+                             ^(int token) {
+        uint64_t state = 0;
+        if (notify_get_state(token, &state) == NOTIFY_STATUS_OK) {
+            handleSaverActionCommand(state);
+        }
+    });
+}
+
+static void unregisterSaverActionNotifySignal(void) {
+    if (gSaverActionNotifyToken == 0) {
+        return;
+    }
+    notify_cancel(gSaverActionNotifyToken);
+    gSaverActionNotifyToken = 0;
 }
 
 static void verifyBundleStillInstalledForCurrentMode(void) {
@@ -3060,9 +3112,10 @@ static NSString* mclMaintainTick(void) {
         mclMaintainRecordState(@"paused", nil, @"coordination_active");
         return @"paused";
     }
-    if (g_fullChargeWindowActive) {
-        // 满充计划正在主动允许充到更高电量：此刻「电流未被压低」是预期行为，
-        // 维持器不得把用户排期的满充窗口顶掉。
+    if (g_fullChargeWindowActive || getLocalBool(@"temp_full_charge_once", NO)) {
+        // 满充计划/临时充满正在主动允许充到更高电量：此刻「电流未被压低」是预期
+        // 行为，维持器不得把窗口顶掉——临时充满期间若把 MCL 重新 engage 到 80，
+        // 窗口会永远充不满（系统侧 powerd ChargeLimit 压在 80）。
         g_mclMaintainNegativeStreak = 0;
         mclMaintainRecordState(@"paused", nil, @"full_charge_window_active");
         return @"paused";
@@ -3439,7 +3492,7 @@ static NSString* notificationMessageIDForChargeCommandTransition(BOOL previousEx
     if ([reason isEqualToString:@"temperature_recovered"] && resumedFromTempPause) {
         return @"noti_resume_charge_temperature";
     }
-    if ([@[@"capacity_low", @"critical_low_battery", @"full_charge_window"] containsObject:reason]) {
+    if ([@[@"capacity_low", @"critical_low_battery", @"full_charge_window", @"temp_full_charge"] containsObject:reason]) {
         return @"noti_start_charge";
     }
     return nil;
@@ -4123,10 +4176,11 @@ static BOOL isDisableInflowRetryEligible(NSDictionary* info, NSString* policySta
     time_t now = time(0);
     int chargeAbove = getLocalInt(@"charge_above", 100);
     BOOL fullChargeWindowActive = isFullChargeWindowActive(now, nil, nil);
-    if (fullChargeWindowActive) {
+    BOOL tempFullChargeActive = getLocalBool(@"temp_full_charge_once", NO);
+    if (fullChargeWindowActive || tempFullChargeActive) {
         chargeAbove = 100;
     }
-    if (fullChargeWindowActive || shouldDisableCapacityControlForTarget(chargeAbove)) {
+    if (fullChargeWindowActive || tempFullChargeActive || shouldDisableCapacityControlForTarget(chargeAbove)) {
         return NO;
     }
     if (capacity.intValue < chargeAbove) {
@@ -4465,6 +4519,80 @@ static void syncSmartChargeCoordination(NSDictionary* info, BOOL isAdaptorConnec
     }
 }
 
+#pragma mark - 充电屏保镜像 + 临时充满单发窗口
+
+// 临时充满单发窗口唯一写入口（幂等）。只写键 + 刷镜像，不做策略重算：
+// - App set_conf / 屏保按钮路径：调用方随后 refreshBatteryStateAndApplyPolicy()
+// - 策略完成路径（applyChargePolicy 内）：调用方本轮继续常规裁决，立即按
+//   capacity_high 停充；在策略体内不做 refresh 整链，避免 applyChargePolicy 重入。
+// 拔电不清零是需求语义（「必须充满一次才算，中途拔掉充电器不用恢复，除非手动去恢复」）：
+// 本函数只在「充满完成 / 手动取消 / 主开关关闭 / 恢复默认配置」四个入口被调用。
+static void setTempFullChargeOnce(BOOL on, NSString* source) {
+    BOOL previous = getLocalBool(@"temp_full_charge_once", NO);
+    if (previous == on) {
+        return;
+    }
+    setLocalBool(@"temp_full_charge_once", on);
+    NSFileInfoLog(@"temp_full_charge_once state=%@ source=%@", on ? @"armed" : @"cleared", source ?: @"unknown");
+    refreshSaverStateMirror();
+}
+
+static NSObject* CLSaverMirrorLock(void) {
+    static NSObject* lock = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        lock = [[NSObject alloc] init];
+    });
+    return lock;
+}
+
+// 屏保镜像（saver_state.plist）：SpringBoard tweak 经 jbroot("var/mobile/ChargeLimiter")
+// 独立解析同一路径只读（daemon root 写、chmod 0644）。内容 diff 守卫——
+// 每个电池事件都会路过，无变化不写盘不广播。锁保护：电池事件跑主线程，
+// set_conf 跑 HTTP 线程，两侧都可能进入（同内容双写幂等，这里消除竞态类）。
+static void refreshSaverStateMirror(void) {
+    @synchronized (CLSaverMirrorLock()) {
+    NSString* root = getRuntimeDataRootPath_C();
+    if (root.length == 0) {
+        return;
+    }
+    int above = getLocalInt(@"charge_above", 100);
+    NSDictionary* payload = @{
+        @"version": @1,
+        @"daemon_enable": @(g_enable),
+        @"saver_enabled": @(getLocalBool(@"charging_saver_enabled", YES)),
+        @"policy_state": g_policyState ?: @"battery",
+        @"policy_reason": g_policyReason ?: @"unknown",
+        @"last_change_ts": @(g_lastPolicyChangeTs),
+        @"charge_above": @(above),
+        @"charge_below": @(getLocalInt(@"charge_below", 20)),
+        @"enable_temp": @(getLocalBool(@"enable_temp", NO)),
+        @"charge_temp_above": @(getLocalFloat(@"charge_temp_above", 40)),
+        @"charge_temp_below": @(getLocalFloat(@"charge_temp_below", 35)),
+        @"temp_full_charge_active": @(getLocalBool(@"temp_full_charge_once", NO)),
+        @"hold_enabled": @(isHoldModeEnabled()),
+        @"hold_band": @(getHoldModeBand()),
+        @"hold_lower": @(getHoldModeLowerBound(above)),
+    };
+    if ([payload isEqualToDictionary:g_lastSaverMirrorPayload]) {
+        return;
+    }
+    g_lastSaverMirrorPayload = payload;
+    NSData* data = [NSPropertyListSerialization dataWithPropertyList:payload
+                                                              format:NSPropertyListXMLFormat_v1_0
+                                                             options:0
+                                                               error:nil];
+    if (data.length == 0) {
+        return;
+    }
+    NSString* path = [root stringByAppendingPathComponent:kSaverMirrorFilename];
+    if ([data writeToFile:path options:NSDataWritingAtomic error:nil]) {
+        chmod(path.fileSystemRepresentation, 0644); // SpringBoard(mobile) 只读
+        notify_post(kSaverStateNotifyName.UTF8String);
+    }
+    }
+}
+
 static void applyChargePolicy(NSDictionary* oldInfo, NSDictionary* info) {
     NSDictionary* safeInfo = info ?: @{};
     NSDictionary* safeOld = oldInfo ?: safeInfo;
@@ -4482,10 +4610,27 @@ static void applyChargePolicy(NSDictionary* oldInfo, NSDictionary* info) {
     }
     int charge_below = getLocalInt(@"charge_below", 0);
     int charge_above = getLocalInt(@"charge_above", 100);
+    // 临时充满单发窗口：与满充计划同款「抬上限到 100、只跳过容量控制、温控保留」，
+    // 但生命周期是单发——唯一自动退出 = 充满一次；拔电不清零（见下方拔线注释）。
+    BOOL temp_full_charge_active = getLocalBool(@"temp_full_charge_once", NO);
+    if (temp_full_charge_active) {
+        // 充满判定：软件电量到 100 为主判据；≥99 且系统已自行停充兜底（老化电池
+        // 极端卡 99% 场景）。达成即清键——本轮策略继续按常规裁决，立即走
+        // capacity_high 停充，同一电池事件内完成「充满 → 恢复」，无窗口期。
+        int capValue = safeInfo[@"CurrentCapacity"] ? [safeInfo[@"CurrentCapacity"] intValue] : 0;
+        BOOL capCharging = [safeInfo[@"IsCharging"] boolValue];
+        if (capValue >= 100 || (capValue >= 99 && !capCharging)) {
+            setTempFullChargeOnce(NO, @"temp_full_charge_completed");
+            temp_full_charge_active = NO;
+        }
+    }
     BOOL full_charge_window_active = isFullChargeWindowActive(now, nil, nil);
-    if (full_charge_window_active) {
-        // 满充计划窗口内只解除电量上限，温控逻辑仍然保留。
+    if (temp_full_charge_active || full_charge_window_active) {
+        // 满充计划/临时充满窗口内只解除电量上限，温控逻辑仍然保留。
         charge_above = 100;
+    }
+    if (temp_full_charge_active) {
+        full_charge_window_active = YES;
     }
     // 只有在显式选择“100% 交由系统控制”或满充计划临时放开上限时，
     // 才旁路容量控制；否则 100% 也继续由软件参与策略控制。
@@ -4587,7 +4732,9 @@ static void applyChargePolicy(NSDictionary* oldInfo, NSDictionary* info) {
                 performAcccharge(YES);
             }
             nextPolicyState = @"charging";
-            nextPolicyReason = @"full_charge_window";
+            // 临时充满单发窗口与满充计划共用同一执行分支，reason 区分来源供
+            // App 状态行与屏保卡映射各自的恢复条件文案。
+            nextPolicyReason = temp_full_charge_active ? @"temp_full_charge" : @"full_charge_window";
             break;
         }
         if (holdCapacityControlActive) {
@@ -4704,6 +4851,10 @@ static void applyChargePolicy(NSDictionary* oldInfo, NSDictionary* info) {
         g_chargeCommandEnabled = YES;
         nextPolicyState = @"battery";
         nextPolicyReason = @"adaptor_disconnected";
+        // 注意：临时充满（temp_full_charge_once）在拔电时刻意不清零——需求语义
+        // 「必须充满一次才算，中途拔掉充电器不用恢复，除非手动去恢复」。窗口
+        // 静默存活，下次插电继续充至 100%；唯一出口 = 充满 / 手动取消 /
+        // 主开关关闭 / 恢复默认配置。此处不是遗漏，勿当 bug 修掉。
     }
     // thermal 档位兜底同步（applyThermalModeForCurrentState 内幂等，未变化直接返回）：
     // 覆盖拔线边沿解除限流残留、daemon 启动/重启对齐上次会话档位、未走命令边沿的
@@ -4808,6 +4959,11 @@ static void initConf(BOOL reset) {
         @"full_charge_sched_duration_hours": @4,
         @"full_charge_sched_anchor_date": @"",
         @"full_charge_sched_next_ts": @0,
+        // 临时充满单发窗口（App limitCard / 锁屏屏保按钮均可武装）：
+        // 唯一自动退出 = 充满一次；拔电不清零；主开关关 / 恢复默认配置强制清零。
+        @"temp_full_charge_once": @NO,
+        // 充电屏保（SpringBoard CLChargingSaver）总开关
+        @"charging_saver_enabled": @YES,
         @"action": @"",
         @"log_level": @"normal",
     };
@@ -5141,6 +5297,10 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         if ([key isEqualToString:@"floatwnd"]) {
             g_enable_floatwnd = [val boolValue];
             showFloatwnd(g_enable_floatwnd);
+        } else if ([key isEqualToString:@"temp_full_charge_once"]) {
+            // 唯一写入口是 setTempFullChargeOnce（幂等 + 统一镜像刷新）；
+            // 若走通用 setConfigValueForKey 先写再分支，幂等守卫会误判「无变化」。
+            setTempFullChargeOnce([val boolValue], @"app_set_conf");
         } else {
             setConfigValueForKey(key, val);
         }
@@ -5153,6 +5313,9 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
                 // 主开关关闭（用户决定 D2/D3）：全量还原系统状态后退出进程并从 launchd
                 // 注销，后台零驻留。resetBatteryStatus() 旧路径（restore=NO）会留下 MCL/
                 // thermal 等残留，必须走完整还原（与 daemon_exit 同级）。
+                // 临时充满窗口一并清零：daemon 退出后若不清，几天后重开主开关会
+                // 意外解除上限充满一次（主开关关闭属于手动操作，符合退出语义）。
+                setTempFullChargeOnce(NO, @"master_off");
                 CLMasterOffShutdown(@"master_off_set_conf");
                 return @{@"status": @0};   // unreachable：Shutdown 不返回
             } else { // 启用时检查
@@ -5216,6 +5379,11 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
             if ([val intValue] >= 100) {
                 resetBatteryStatus();
             }
+        } else if ([key isEqualToString:@"temp_full_charge_once"]) {
+            // 键已由前置特判经 setTempFullChargeOnce 写入，这里补策略即时生效
+            refreshBatteryStateAndApplyPolicy();
+        } else if ([key isEqualToString:@"charging_saver_enabled"]) {
+            // 镜像由处理尾的统一刷新落盘；开关只是 payload 字段，无需策略动作
         } else if ([@[
             @"full_charge_sched_enabled",
             @"full_charge_sched_interval_days",
@@ -5249,6 +5417,8 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         if (shouldRefreshBatteryPolicyForConfigKey(key)) {
             refreshBatteryStateAndApplyPolicy();
         }
+        // set_conf 统一尾随：屏保镜像内容 diff 守卫，涉及键变化才真正写盘+广播
+        refreshSaverStateMirror();
        return @{
            @"status": @0,
        };
@@ -5288,6 +5458,9 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         tryRestoreSmartChargeAfterCoordination(@"reset_conf");
         refreshFullChargeScheduleTimer(0);
         evaluateFullChargeSchedule(YES);
+        // initConf(YES) 直写默认值（含 temp_full_charge_once=NO）绕过 per-key 反应，
+        // 这里补一次镜像对齐，屏保立刻回到未武装态。
+        refreshSaverStateMirror();
         return @{
             @"status": @0,
         };
@@ -5327,6 +5500,7 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         data[@"SmartChargeCoordinationSessionID"] = g_smartChargeCoordinationSessionID ?: @"";
         data[@"SmartChargeCoordinationStartTime"] = @(g_smartChargeCoordinationStartedTs);
         data[@"PolicyReason"] = g_policyReason ?: @"unknown";
+        data[@"TempFullChargeActive"] = @(getLocalBool(@"temp_full_charge_once", NO));
         data[@"LastPolicyChangeReason"] = g_lastPolicyChangeReason ?: @"unknown";
         data[@"LastPolicyChangeTime"] = @(g_lastPolicyChangeTs);
         data[@"LastChargeCommandTime"] = @(g_lastChargeCommandTs);
@@ -5896,6 +6070,7 @@ void detectUPSBattery() {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runSrc, kCFRunLoopDefaultMode);
         registerDaemonResetAndExitSignal();
         registerDaemonRestoreNotifySignal();
+        registerSaverActionNotifySignal();
         refreshTrollStoreBundleCheckTimer();
         io_service_t serv = getIOPMPSServ();
         if (serv != IO_OBJECT_NULL) {
@@ -5926,6 +6101,9 @@ void detectUPSBattery() {
         // nextPolicyState==charging 时调用 performAcccharge(YES)，命中幂等守卫
         // 首次应用加速项。这是 userspace 重启后已插电稳态首次应用加速项的兜底。
         refreshBatteryStateAndApplyPolicy();
+        // 主开关关闭态启动（g_enable=NO）时上面早退，策略提交尾随不会执行；
+        // 显式补一次镜像落盘，保证 SpringBoard 屏保拿到启动基线。
+        refreshSaverStateMirror();
         NSFileInfoLog(@"%@ daemon_started backend=%@ port=%d",
                       log_prefix,
                       @"bsd_socket",

@@ -129,6 +129,9 @@ NSNotificationName const CLDaemonStatusDidChangeNotification = @"CLDaemonStatusD
     _chargeTempAbove = [data[@"charge_temp_above"] integerValue];
     id historyStatsEnabledValue = data[@"history_stats_enabled"];
     _historyStatsEnabled = historyStatsEnabledValue == nil ? YES : [historyStatsEnabledValue boolValue];
+    // 充电屏保开关（旧 daemon 缺键时按默认开启显示，写回后由 daemon 定案）
+    id chargingSaverValue = data[@"charging_saver_enabled"];
+    _chargingSaverEnabled = chargingSaverValue == nil ? YES : [chargingSaverValue boolValue];
 
     _accChargeEnabled = [data[@"acc_charge"] boolValue];
     _accChargeAirMode = [data[@"acc_charge_airmode"] boolValue];
@@ -322,6 +325,8 @@ NSNotificationName const CLDaemonStatusDidChangeNotification = @"CLDaemonStatusD
         self.holdRangeLower = [data[@"HoldRangeLower"] integerValue];
         self.policyState = data[@"PolicyState"];
         self.policyReason = data[@"PolicyReason"];
+        // 临时充满单发窗口状态（旧 daemon 不带该字段时保持 NO，按未武装显示）
+        self.tempFullChargeOnce = [data[@"TempFullChargeActive"] boolValue];
         self.lastPolicyChangeReason = data[@"LastPolicyChangeReason"];
         self.lastPolicyChangeTime = [data[@"LastPolicyChangeTime"] doubleValue];
         self.lastChargeCommandTime = [data[@"LastChargeCommandTime"] doubleValue];

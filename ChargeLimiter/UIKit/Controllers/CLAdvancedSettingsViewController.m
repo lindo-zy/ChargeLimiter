@@ -845,6 +845,9 @@ static NSString *CLPolicyReasonLabel(NSString *reason) {
     if ([reason isEqualToString:@"full_charge_window"]) {
         return CLL(@"满充计划窗口内，暂时解除上限");
     }
+    if ([reason isEqualToString:@"temp_full_charge"]) {
+        return CLL(@"临时充满一次，充满后自动恢复上限");
+    }
     if ([reason isEqualToString:@"hold_target_reached"]) {
         return CLL(@"达到保持目标，停止充电");
     }

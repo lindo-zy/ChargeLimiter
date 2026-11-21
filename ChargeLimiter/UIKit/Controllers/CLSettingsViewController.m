@@ -1672,6 +1672,9 @@ static NSString *CLHistoryPolicyReasonLabel(NSString *reason) {
     if ([reason isEqualToString:@"full_charge_window"]) {
         return CLL(@"满充计划窗口内，暂时解除上限");
     }
+    if ([reason isEqualToString:@"temp_full_charge"]) {
+        return CLL(@"临时充满一次，充满后自动恢复上限");
+    }
     if ([reason isEqualToString:@"hold_target_reached"]) {
         return CLL(@"达到保持目标，停止充电");
     }
@@ -4481,6 +4484,7 @@ static UIViewController *CLTopVisibleViewController(void) {
 #pragma mark - 软件设置页面
 
 static const NSInteger CLSoftwareNotificationSwitchTag = 4201;
+static const NSInteger CLChargingSaverSwitchTag = 4202;
 
 static NSString *CLDaemonLanguageValueForLocaleIdentifier(NSString *identifier) {
     NSString *lang = [identifier isKindOfClass:[NSString class]] ? identifier.lowercaseString : @"";
@@ -4732,6 +4736,12 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     [self.settingsCard addNavigationRowWithIcon:@"globe" title:CLL(@"语言") value:[self languageValueLabel] color:[UIColor systemBlueColor] target:self action:@selector(languageTapped)];
     [self.settingsCard addSeparator];
     [self.settingsCard addNavigationRowWithIcon:@"moon.fill" title:CLL(@"深色模式") value:[self appearanceValueLabel] color:[UIColor systemGrayColor] target:self action:@selector(darkModeTapped)];
+    [self.settingsCard addSeparator];
+    // 充电屏保：锁屏充电时显示当前充电策略卡（SpringBoard CLChargingSaver）
+    [self.settingsCard addSwitchRowWithIcon:@"moon.stars" title:CLL(@"充电屏保") isOn:manager.chargingSaverEnabled color:[UIColor systemIndigoColor] tag:CLChargingSaverSwitchTag onChange:^(BOOL isOn) {
+        [CLBatteryManager shared].chargingSaverEnabled = isOn;
+        [[CLAPIClient shared] setConfigWithKey:@"charging_saver_enabled" value:@(isOn) completion:nil];
+    }];
     [self.settingsCard addSeparator];
     [self.settingsCard addNavigationRowWithIcon:@"tag.fill" title:CLL(@"停充预设") value:[self chargeAbovePresetValueLabel] color:CLStopChargePresetAccentColor() target:self action:@selector(stopChargePresetTapped)];
     [self.settingsCard addSeparator];
@@ -5454,9 +5464,11 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 @property (nonatomic, assign) NSInteger chargeAbove;
 @property (nonatomic, strong) UIView *chargeBelowRow;
 @property (nonatomic, strong) UIView *chargeAboveRow;      // 停止充电行
+@property (nonatomic, strong) UIView *tempFullChargeRow;   // 临时充满一次行
 @property (nonatomic, strong) UIButton *chargeAbovePresetButton;
 @property (nonatomic, strong) UIButton *setChargeAboveCurrentButton;
 @property (nonatomic, strong) UIView *chargeBelowSeparator;
+@property (nonatomic, strong) UIView *tempFullChargeSeparator;
 @property (nonatomic, strong) UIView *tempBelowRow;        // 温度下限行
 @property (nonatomic, strong) UIView *tempAboveRow;        // 温度上限行
 @property (nonatomic, strong) UIView *tempSeparator1;
@@ -6402,6 +6414,13 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     }];
     [self attachSetCurrentButtonToChargeAboveRow];
 
+    // 临时充满一次（单发窗口）：充满即自动恢复上限；拔电不清零；点按再次取消
+    [self.limitCard addNavigationRowWithIcon:@"battery.100.bolt"
+        title:CLL(@"临时充满一次") value:[self tempFullChargeStatusLabel]
+        color:[UIColor systemGreenColor] target:self action:@selector(tempFullChargeRowTapped)];
+    self.tempFullChargeRow = self.limitCard.contentStack.arrangedSubviews.lastObject;
+    self.tempFullChargeSeparator = [self.limitCard addSeparator];
+
     // 保存分隔线引用
     self.chargeBelowSeparator = [self.limitCard addSeparator];
     
@@ -6422,6 +6441,60 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     self.chargeBelowRow.alpha = 0;
     self.chargeBelowSeparator.hidden = YES;
     self.chargeBelowSeparator.alpha = 0;
+}
+
+#pragma mark - 临时充满一次（单发窗口）
+
+- (NSString *)tempFullChargeStatusLabel {
+    if ([CLBatteryManager shared].tempFullChargeOnce) {
+        return CLL(@"充满中 · 点按取消");
+    }
+    return CLL(@"充至100%后恢复");
+}
+
+- (void)refreshTempFullChargeRow {
+    if (!self.tempFullChargeRow) {
+        return;
+    }
+    [self updateCardValue:self.limitCard title:CLL(@"临时充满一次") value:[self tempFullChargeStatusLabel]];
+}
+
+// 武装/取消共用唯一写路径：本地即时回显 → daemon 确认（下轮 get_bat_info 的
+// TempFullChargeActive 为准）；写失败回滚本地状态。
+- (void)setTempFullChargeOnceEnabled:(BOOL)enabled {
+    CLBatteryManager *manager = [CLBatteryManager shared];
+    manager.tempFullChargeOnce = enabled;
+    [self refreshTempFullChargeRow];
+    __weak typeof(self) weakSelf = self;
+    [[CLAPIClient shared] setConfigWithKey:@"temp_full_charge_once" value:@(enabled) completion:^(NSDictionary * _Nullable response, NSError * _Nullable error) {
+        BOOL ok = (response && [response[@"status"] intValue] == 0);
+        if (!ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // 写失败回滚本地回显（回到操作前状态），下轮轮询以 daemon 为准
+                [CLBatteryManager shared].tempFullChargeOnce = !enabled;
+                [weakSelf refreshTempFullChargeRow];
+            });
+        }
+    }];
+}
+
+- (void)tempFullChargeRowTapped {
+    CLBatteryManager *manager = [CLBatteryManager shared];
+    if (manager.tempFullChargeOnce) {
+        // 取消是安全方向：单点直接取消，无需确认（与锁屏屏保按钮同语义）
+        [self setTempFullChargeOnceEnabled:NO];
+        return;
+    }
+    // 武装需确认：临时解除上限属于策略级动作，防误触
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:CLL(@"临时充满一次？")
+        message:CLL(@"将暂时解除上限，充满后自动恢复。中途拔电不失效，可随时手动取消。")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:CLL(@"取消") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:CLL(@"启动") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf setTempFullChargeOnceEnabled:YES];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)attachSetCurrentButtonToChargeAboveRow {
@@ -7362,6 +7435,7 @@ static BOOL CLDisplayedPowerStateUsesExternalPower(CLBatteryManager *manager) {
     NSString *powerStateLabel = [self powerStateLabelForManager:manager];
     [self updateSetChargeAboveCurrentButtonState];
     [self updatePowerPathHoldVisibilityForManager:manager];
+    [self refreshTempFullChargeRow];
 
     // 仅限流模式：直读会话状态随电池事件刷新（插拔边沿 → 会话状态行/验证行）
     if (manager.operationMode == CLOperationModeLimitOnly) {

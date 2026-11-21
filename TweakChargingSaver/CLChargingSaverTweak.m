@@ -1,0 +1,905 @@
+// CLChargingSaver —— ChargeLimiter 充电屏保（锁屏策略卡）执行端，仅注入 SpringBoard。
+//
+// 宿主/让位/挂载模式参考本地 Metis 工程 Modules/Charging（CSCoverSheetViewController
+// hook 套装 + 窗口层挂载 + 通知栈让位 + 密码页摘卡），内容换血为「当前充电策略」：
+// hero 策略动作 + 电量环（目标刻度）+ 参数网格 + 恢复条件 + 锁屏启动临时充满按钮。
+//
+// 数据通路（零网络、零 App 依赖）：
+//   读 —— jbroot("var/mobile/ChargeLimiter/saver_state.plist") 镜像：daemon root 写、
+//         chmod 0644、内容 diff 后落盘并广播 com.chargelimiter.policystate；
+//         本进程 1s tick 兜底重读。电池实时值（电量/温度/健康）IOKit 直读（Metis 同款）。
+//   写 —— com.chargelimiter.saveraction notify（state=1 启动临时充满 / 2 取消），
+//         与 CLThermalSim 的 thermalapply 通道同款 notify 命令模式；daemon 处理后
+//         镜像回传（按钮 2s 内回显，超时判守护未响应并还原）。
+//
+// 交互安全面：
+//   - 卡片容器重写 hitTest：仅按钮条命中，其余区域返回 nil 穿透锁屏手势
+//     （容器 userInteractionEnabled=NO 会让整个子树收不到触摸，故用 hitTest 裁剪）。
+//   - 启动临时充满 = 两击确认（3s 倒计时，超时还原）+ 震动反馈；取消为安全方向单点。
+//   - daemon 不在场 / charging_saver_enabled 关 / 未插电 → 整卡不显示（回退安全）。
+//
+// 并发模型（防卡死基线）：hook 回调全部主线程；IOKit 注册表读数走串行后台队列，
+// 主线程只做 UI；无锁无跨线程等待；drawRect 前置 nil 守卫。
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import <notify.h>
+#import <IOKit/IOKitLib.h>
+#import <substrate.h>
+#import <libroot/libroot.h>
+#include <math.h>
+#include <string.h>
+#include <sys/stat.h>
+
+static NSString * const CLSaverMirrorNotifyName = @"com.chargelimiter.policystate";
+static NSString * const CLSaverActionNotifyName = @"com.chargelimiter.saveraction";
+static const CGFloat CLSaverCardDesignWidth = 344.0;
+static const CGFloat CLSaverCardDesignHeight = 324.0;
+static const NSTimeInterval CLSaverEchoTimeoutSeconds = 2.0;
+static const NSTimeInterval CLSaverConfirmWindowSeconds = 3.0;
+
+#pragma mark - 电池直读（Metis 同款原语）
+
+static NSDictionary *CLSaverReadBattery(void) {
+    // 仅探测电池服务节点；注册表读数只发生在采样队列，绝不进 SpringBoard 布局路径。
+    for (NSString *name in @[@"AppleSmartBattery", @"AppleARMPMUPowerSource", @"IOPMPowerSource"]) {
+        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(name.UTF8String));
+        if (!service) continue;
+        CFMutableDictionaryRef properties = NULL;
+        kern_return_t result = IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0);
+        IOObjectRelease(service);
+        if (result == KERN_SUCCESS && properties) {
+            NSDictionary *values = CFBridgingRelease(properties);
+            if ([values isKindOfClass:[NSDictionary class]] &&
+                (values[@"ExternalConnected"] || values[@"CurrentCapacity"] || values[@"Voltage"])) {
+                return values;
+            }
+        }
+    }
+    return @{};
+}
+
+static BOOL CLSaverDeviceLocked(void) {
+    // SBLockScreenManager isUILocked：签名探测式调用（Metis 同款），旧系统签名不符
+    // 一律按未锁处理（宁可不显示，不可误显示）。
+    Class cls = NSClassFromString(@"SBLockScreenManager");
+    SEL shared = NSSelectorFromString(@"sharedInstance"), locked = NSSelectorFromString(@"isUILocked");
+    NSMethodSignature *factory = [cls methodSignatureForSelector:shared];
+    if (!factory || factory.numberOfArguments != 2 || strcmp(factory.methodReturnType, "@")) return NO;
+    @try {
+        id manager = ((id (*)(id, SEL))objc_msgSend)(cls, shared);
+        NSMethodSignature *signature = [manager methodSignatureForSelector:locked];
+        if (!signature || signature.numberOfArguments != 2 ||
+            (strcmp(signature.methodReturnType, "B") && strcmp(signature.methodReturnType, "c"))) return NO;
+        return ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
+    } @catch (__unused NSException *exception) { return NO; }
+}
+
+static BOOL CLSaverBool(id object, NSString *name, BOOL fallback) {
+    SEL selector = NSSelectorFromString(name);
+    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+    if (!signature || signature.numberOfArguments != 2 ||
+        (strcmp(signature.methodReturnType, "B") && strcmp(signature.methodReturnType, "c"))) return fallback;
+    @try {
+        return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector);
+    } @catch (__unused NSException *exception) { return fallback; }
+}
+
+#pragma mark - 策略文案映射（与 App CLHistoryPolicyStateLabel 同源语义）
+
+@interface CLSaverStrategy : NSObject
+@property (nonatomic, copy) NSString *heroTitle;      // 大字策略动作
+@property (nonatomic, copy) NSString *heroSubtitle;   // 「当前策略 · …」
+@property (nonatomic, copy) NSString *badgeTitle;     // 底部胶囊
+@property (nonatomic, copy) NSString *recoveryNote;   // 底部恢复条件（右对齐）
+@property (nonatomic, assign) BOOL warning;           // 停充/临时充满 → 橙色系
+@end
+@implementation CLSaverStrategy
+@end
+
+static CLSaverStrategy *CLSaverStrategyForMirror(NSDictionary *mirror) {
+    CLSaverStrategy *s = [CLSaverStrategy new];
+    NSString *state = [mirror isKindOfClass:[NSDictionary class]] ? (mirror[@"policy_state"] ?: @"battery") : @"battery";
+    BOOL tempFull = mirror[@"temp_full_charge_active"] ? [mirror[@"temp_full_charge_active"] boolValue] : NO;
+    NSInteger above = mirror[@"charge_above"] ? [mirror[@"charge_above"] integerValue] : 100;
+    NSInteger below = mirror[@"charge_below"] ? [mirror[@"charge_below"] integerValue] : 20;
+    if (tempFull) {
+        s.heroTitle = @"临时充满中";
+        s.heroSubtitle = @"当前策略 · 上限已临时解除";
+        s.badgeTitle = @"临时充满中";
+        s.recoveryNote = [NSString stringWithFormat:@"充满后自动恢复 %ld%%", (long)above];
+        s.warning = YES;
+        return s;
+    }
+    if ([state isEqualToString:@"charging"]) {
+        s.heroTitle = @"正在充电";
+        s.heroSubtitle = @"当前策略 · 插电即充";
+        s.badgeTitle = @"正在充电";
+        s.recoveryNote = [NSString stringWithFormat:@"到 %ld%% 自动停充", (long)above];
+    } else if ([state isEqualToString:@"temp_paused"]) {
+        float tempBelow = mirror[@"charge_temp_below"] ? [mirror[@"charge_temp_below"] floatValue] : 35.0;
+        s.heroTitle = @"温控暂停";
+        s.heroSubtitle = @"当前策略 · 温度达到上限";
+        s.badgeTitle = @"温控暂停";
+        s.recoveryNote = [NSString stringWithFormat:@"温度 ≤%.0f° 恢复充电", tempBelow];
+        s.warning = YES;
+    } else if ([state isEqualToString:@"hold"] || [state isEqualToString:@"hold_recharge"]) {
+        NSInteger lower = mirror[@"hold_lower"] ? [mirror[@"hold_lower"] integerValue] : (above - 5);
+        s.heroTitle = @"插电保持";
+        s.heroSubtitle = @"当前策略 · 插电保持";
+        s.badgeTitle = @"插电保持";
+        s.recoveryNote = [NSString stringWithFormat:@"保持区间 %ld–%ld%%", (long)lower, (long)above];
+    } else if ([state isEqualToString:@"stopped"] || [state isEqualToString:@"no_inflow"]) {
+        s.heroTitle = @"已停充";
+        s.heroSubtitle = @"当前策略 · 达到电量上限";
+        s.badgeTitle = @"已停充";
+        s.recoveryNote = [NSString stringWithFormat:@"低于 %ld%% 自动恢复充电", (long)below];
+        s.warning = YES;
+    } else {
+        s.heroTitle = @"未充电";
+        s.heroSubtitle = @"当前策略 · 等待充电";
+        s.badgeTitle = @"未充电";
+        s.recoveryNote = @"等待充电策略执行";
+    }
+    return s;
+}
+
+#pragma mark - 策略卡（ink = drawRect 文本/环/网格，cta = 真实可点按钮条）
+
+static UIColor *CLSaverGreen(void) { return [UIColor colorWithRed:0.44 green:0.93 blue:0.67 alpha:1]; }
+static UIColor *CLSaverOrange(void) { return [UIColor colorWithRed:1.0 green:0.725 blue:0.35 alpha:1]; }
+
+// 注册表读数类型守卫：AppleSmartBattery 字段应为 NSNumber；非数值类型一律兜底，
+// 不走裸 intValue/intValue 转换（防未来固件字段类型变化的 unrecognized selector 闪退）。
+static NSInteger CLSaverIntValue(id value, NSInteger fallback) {
+    if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value integerValue];
+    return fallback;
+}
+static double CLSaverDoubleValue(id value, double fallback) {
+    if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value doubleValue];
+    return fallback;
+}
+
+static void CLSaverText(NSString *text, CGRect rect, CGFloat size, UIFontWeight weight, UIColor *color, NSTextAlignment align) {
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = align;
+    style.lineBreakMode = NSLineBreakByTruncatingTail;
+    [text drawInRect:rect withAttributes:@{NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:size weight:weight],
+        NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}];
+}
+
+@interface CLSaverCardInk : UIView
+@property (nonatomic, strong) NSDictionary *mirror;
+@property (nonatomic, strong) NSDictionary *battery;
+@end
+
+@implementation CLSaverCardInk
+- (void)drawRect:(CGRect)rect {
+    NSDictionary *mirror = self.mirror;
+    if (!mirror) return;
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    CGContextSaveGState(context);
+    CGContextScaleCTM(context, self.bounds.size.width / CLSaverCardDesignWidth, self.bounds.size.height / CLSaverCardDesignHeight);
+    UIColor *white = UIColor.whiteColor;
+    UIColor *muted = [white colorWithAlphaComponent:0.64];
+    UIColor *dim = [white colorWithAlphaComponent:0.35];
+    CLSaverStrategy *strategy = CLSaverStrategyForMirror(mirror);
+    UIColor *accent = strategy.warning ? CLSaverOrange() : CLSaverGreen();
+
+    BOOL tempFull = mirror[@"temp_full_charge_active"] ? [mirror[@"temp_full_charge_active"] boolValue] : NO;
+    NSInteger above = mirror[@"charge_above"] ? [mirror[@"charge_above"] integerValue] : 100;
+    NSInteger below = mirror[@"charge_below"] ? [mirror[@"charge_below"] integerValue] : 20;
+    BOOL enableTemp = mirror[@"enable_temp"] ? [mirror[@"enable_temp"] boolValue] : NO;
+    float tempAbove = mirror[@"charge_temp_above"] ? [mirror[@"charge_temp_above"] floatValue] : 40.0;
+
+    int capacity = (int)CLSaverIntValue(self.battery[@"CurrentCapacity"], 0);
+    float temperature = self.battery[@"Temperature"] ? ((float)CLSaverDoubleValue(self.battery[@"Temperature"], NAN) / 100.0) : NAN;
+    double maxCap = CLSaverDoubleValue(self.battery[@"AppleRawMaxCapacity"], NAN);
+    double designCap = CLSaverDoubleValue(self.battery[@"AppleRawDesignCapacity"], NAN);
+    int cycleCount = (int)CLSaverIntValue(self.battery[@"CycleCount"], 0);
+
+    CLSaverText(strategy.heroTitle, CGRectMake(17, 12, 200, 42), 30, UIFontWeightSemibold, white, NSTextAlignmentLeft);
+    CLSaverText(strategy.heroSubtitle, CGRectMake(18, 58, 210, 17), 10.5, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
+
+    // 电量环：填充 = 电量比例；目标刻度 = 停充上限（临时充满时 100%）
+    CGFloat ringTarget = tempFull ? 100.0 : (CGFloat)above;
+    BOOL targetReached = capacity >= ringTarget;
+    CGPoint center = CGPointMake(304, 44);
+    CGFloat radius = 27;
+    UIBezierPath *track = [UIBezierPath bezierPathWithArcCenter:center radius:radius startAngle:-M_PI_2 endAngle:M_PI * 1.5 clockwise:YES];
+    track.lineWidth = 4.5;
+    [[white colorWithAlphaComponent:0.13] setStroke];
+    [track stroke];
+    if (capacity > 0) {
+        CGFloat fraction = MIN(capacity / 100.0, 1.0);
+        UIBezierPath *ring = [UIBezierPath bezierPathWithArcCenter:center radius:radius startAngle:-M_PI_2
+                                                             endAngle:-M_PI_2 + M_PI * 2 * fraction clockwise:YES];
+        ring.lineWidth = 4.5;
+        ring.lineCapStyle = kCGLineCapRound;
+        [accent setStroke];
+        [ring stroke];
+    }
+    // 目标刻度线：到达后用白色（与弧末端重合仍可辨），未到用目标色
+    CGFloat tickAngle = -M_PI_2 + M_PI * 2 * (ringTarget / 100.0);
+    CGPoint tickOuter = CGPointMake(center.x + cosf(tickAngle) * (radius + 3.5), center.y + sinf(tickAngle) * (radius + 3.5));
+    CGPoint tickInner = CGPointMake(center.x + cosf(tickAngle) * (radius - 3.5), center.y + sinf(tickAngle) * (radius - 3.5));
+    UIBezierPath *tick = [UIBezierPath bezierPath];
+    [tick moveToPoint:tickInner];
+    [tick addLineToPoint:tickOuter];
+    tick.lineWidth = 2.4;
+    tick.lineCapStyle = kCGLineCapRound;
+    [targetReached ? UIColor.whiteColor : accent setStroke];
+    [tick stroke];
+    CLSaverText([NSString stringWithFormat:@"%d%%", capacity], CGRectMake(274, 30, 60, 22), 15, UIFontWeightBold, white, NSTextAlignmentCenter);
+    CLSaverText([NSString stringWithFormat:@"目标 %ld%%", (long)ringTarget], CGRectMake(266, 80, 76, 15), 9, UIFontWeightSemibold, muted, NSTextAlignmentCenter);
+
+    [[white colorWithAlphaComponent:0.1] setStroke];
+    UIBezierPath *dividers = [UIBezierPath bezierPath];
+    [dividers moveToPoint:CGPointMake(17, 100)];
+    [dividers addLineToPoint:CGPointMake(327, 100)];
+    [dividers moveToPoint:CGPointMake(17, 163)];
+    [dividers addLineToPoint:CGPointMake(327, 163)];
+    for (NSNumber *x in @[@119, @237]) {
+        [dividers moveToPoint:CGPointMake(x.doubleValue, 112)];
+        [dividers addLineToPoint:CGPointMake(x.doubleValue, 150)];
+        [dividers moveToPoint:CGPointMake(x.doubleValue, 175)];
+        [dividers addLineToPoint:CGPointMake(x.doubleValue, 213)];
+    }
+    dividers.lineWidth = 0.35;
+    [dividers stroke];
+
+    NSArray *rowTitles = @[@"停充上限", @"开始充电", @"电池温度", @"温度控制", @"临时充满", @"电池健康"];
+    NSString *tempText = isfinite(temperature) ? [NSString stringWithFormat:@"%.1f°C", temperature] : @"—";
+    NSString *healthText = (isfinite(maxCap) && isfinite(designCap) && designCap > 0)
+        ? [NSString stringWithFormat:@"%.0f%%", maxCap * 100.0 / designCap] : (cycleCount > 0 ? [NSString stringWithFormat:@"%ld 次", (long)cycleCount] : @"—");
+    NSString *tempFullText = tempFull ? @"激活中" : @"未启用";
+    NSArray *rowValues = @[
+        [NSString stringWithFormat:@"%ld%%", (long)above],
+        [NSString stringWithFormat:@"%ld%%", (long)below],
+        tempText,
+        enableTemp ? [NSString stringWithFormat:@"开 · %.0f°", tempAbove] : @"关",
+        tempFullText,
+        healthText,
+    ];
+    for (NSUInteger i = 0; i < 6; i++) {
+        CGFloat x = (i % 3) == 0 ? 18 : ((i % 3) == 1 ? 132 : 250);
+        CGFloat y = i < 3 ? 112 : 175;
+        CLSaverText(rowTitles[i], CGRectMake(x, y, 86, 15), 9.5, UIFontWeightSemibold, muted, NSTextAlignmentLeft);
+        UIColor *valueColor = white;
+        if ([rowTitles[i] isEqualToString:@"临时充满"]) valueColor = tempFull ? CLSaverOrange() : dim;
+        CLSaverText(rowValues[i], CGRectMake(x, y + 17, 92, 20), 14, UIFontWeightSemibold, valueColor, NSTextAlignmentLeft);
+    }
+
+    // 底部状态胶囊 + 恢复条件
+    CGRect badge = CGRectMake(17, 226, 88, 20);
+    [[accent colorWithAlphaComponent:0.14] setFill];
+    [[UIBezierPath bezierPathWithRoundedRect:badge cornerRadius:10] fill];
+    CLSaverText(strategy.badgeTitle, CGRectMake(20, 229, 82, 16), 10, UIFontWeightSemibold, accent, NSTextAlignmentCenter);
+    CLSaverText(strategy.recoveryNote, CGRectMake(112, 229, 216, 16), 10, UIFontWeightMedium, muted, NSTextAlignmentRight);
+    CGContextRestoreGState(context);
+}
+@end
+
+@interface CLSaverCTAView : UIView
+// ctaState: 0 未武装(可启动) / 1 确认态(倒计时) / 2 已武装(可取消) / 3 待回显 / 4 守护未响应
+@property (nonatomic, assign) NSInteger ctaState;
+@property (nonatomic, assign) CGFloat confirmProgress; // 0..1 确认倒计时进度
+@property (nonatomic, copy) void (^onTap)(NSInteger currentState);
+@end
+
+@implementation CLSaverCTAView
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.30];
+        self.layer.cornerRadius = 14;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.layer.borderWidth = 1.0;
+        self.userInteractionEnabled = YES;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
+        [self addGestureRecognizer:tap];
+    }
+    return self;
+}
+- (void)handleTap:(UITapGestureRecognizer *)gesture {
+    if (self.onTap) self.onTap(self.ctaState);
+}
+- (void)drawRect:(CGRect)rect {
+    UIColor *green = CLSaverGreen();
+    UIColor *orange = CLSaverOrange();
+    NSString *text = @"";
+    UIColor *color = green;
+    UIColor *border = [green colorWithAlphaComponent:0.35];
+    UIColor *fill = [green colorWithAlphaComponent:0.10];
+    if (self.ctaState == 0) {
+        text = @"⚡ 启动临时充满 · 充满后自动恢复上限";
+    } else if (self.ctaState == 1) {
+        text = [NSString stringWithFormat:@"再点一次确认 · %.0f 秒内生效", CLSaverConfirmWindowSeconds];
+        color = orange;
+        border = [orange colorWithAlphaComponent:0.55];
+        fill = [orange colorWithAlphaComponent:0.16];
+    } else if (self.ctaState == 2) {
+        text = @"取消临时充满";
+        color = orange;
+        border = [orange colorWithAlphaComponent:0.45];
+        fill = [orange colorWithAlphaComponent:0.10];
+    } else if (self.ctaState == 3) {
+        text = @"已发送 · 等待守护确认…";
+        color = [UIColor colorWithWhite:1 alpha:0.7];
+        border = [UIColor colorWithWhite:1 alpha:0.2];
+        fill = [UIColor colorWithWhite:1 alpha:0.05];
+    } else {
+        text = @"守护未响应 · 请检查 ChargeLimiter";
+        color = [UIColor colorWithWhite:1 alpha:0.5];
+        border = [UIColor colorWithWhite:1 alpha:0.12];
+        fill = [UIColor colorWithWhite:1 alpha:0.04];
+    }
+    self.layer.borderColor = border.CGColor;
+    self.backgroundColor = fill;
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = NSTextAlignmentCenter;
+    style.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [text drawInRect:CGRectInset(rect, 8, 0)
+       withAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold],
+                        NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}];
+    if (self.ctaState == 1) {
+        // 确认倒计时进度条（底边）
+        CGFloat progressWidth = rect.size.width * MAX(0, MIN(self.confirmProgress, 1.0));
+        CGRect bar = CGRectMake(0, rect.size.height - 3, progressWidth, 3);
+        [[orange colorWithAlphaComponent:0.8] setFill];
+        [[UIBezierPath bezierPathWithRoundedRect:bar cornerRadius:1.5] fill];
+    }
+}
+@end
+
+@interface CLSaverCardView : UIView
+@property (nonatomic, strong) CLSaverCardInk *ink;
+@property (nonatomic, strong) CLSaverCTAView *cta;
+@end
+
+@implementation CLSaverCardView
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.layer.cornerRadius = 26;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.clipsToBounds = YES;
+        self.layer.borderWidth = 0.5;
+        self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
+        self.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.58];
+        self.ink = [[CLSaverCardInk alloc] initWithFrame:self.bounds];
+        self.ink.backgroundColor = UIColor.clearColor;
+        self.ink.opaque = NO;
+        self.ink.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self addSubview:self.ink];
+        self.cta = [[CLSaverCTAView alloc] initWithFrame:CGRectZero];
+        [self addSubview:self.cta];
+        // 容器必须可交互才能让 hitTest 裁剪生效（userInteractionEnabled=NO 会让整个
+        // 子树收不到触摸）；非按钮区域由 hitTest 返回 nil 穿透锁屏手势。
+        self.userInteractionEnabled = YES;
+    }
+    return self;
+}
+// 仅按钮条命中：其余区域返回 nil，触摸继续走锁屏系统手势（Metis 免触控语义的局部化）
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (CGRectContainsPoint(self.cta.frame, point) && self.cta.hidden == NO && self.cta.alpha > 0.01) {
+        return [self.cta hitTest:[self.cta convertPoint:point fromView:self] withEvent:event] ?: self.cta;
+    }
+    return nil;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat scale = self.bounds.size.width / CLSaverCardDesignWidth;
+    CGFloat inkHeight = 254.0 * scale;
+    self.ink.frame = CGRectMake(0, 0, self.bounds.size.width, inkHeight);
+    CGFloat ctaX = 14.0 * scale;
+    CGFloat ctaHeight = 44.0 * scale;
+    self.cta.frame = CGRectMake(ctaX, self.bounds.size.height - ctaHeight - 12.0 * scale,
+                                self.bounds.size.width - ctaX * 2, ctaHeight);
+}
+@end
+
+#pragma mark - 运行时（宿主 hook + 采样 + 卡片生命周期）
+
+@interface CLSaverRuntime : NSObject
+@property (nonatomic, weak) UIViewController *host;
+@property (nonatomic, weak) UIViewController *passcodeController;
+@property (nonatomic, strong) CLSaverCardView *card;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, strong) dispatch_queue_t samplingQueue;
+@property (nonatomic, strong) NSDictionary *mirror;              // saver_state.plist 内容
+@property (nonatomic, assign) BOOL appeared;
+@property (nonatomic, assign) BOOL displayOn;
+@property (nonatomic, assign) BOOL sampling;
+@property (nonatomic, assign) NSUInteger generation;
+@property (nonatomic, assign) NSTimeInterval lastProbeTime;
+@property (nonatomic, assign) NSInteger pendingAction;           // 0 无 / 1 启动 / 2 取消
+@property (nonatomic, assign) NSTimeInterval pendingActionTime;
+@property (nonatomic, assign) NSTimeInterval hintShownTime;      // 「守护未响应」提示起始时间
+@property (nonatomic, assign) int displayToken;
+@property (nonatomic, assign) int lockToken;
+@property (nonatomic, assign) int mirrorToken;
++ (instancetype)shared;
+- (void)refresh;
+- (void)layout;
+- (void)stop;
+- (void)reloadMirror;
+- (void)sampleBattery;
+@end
+
+@implementation CLSaverRuntime
+
++ (instancetype)shared {
+    static CLSaverRuntime *runtime;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ runtime = [self new]; });
+    return runtime;
+}
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _samplingQueue = dispatch_queue_create("com.chargelimiter.saver", DISPATCH_QUEUE_SERIAL);
+        _displayOn = YES; _displayToken = -1; _lockToken = -1; _mirrorToken = -1;
+        __weak typeof(self) weakSelf = self;
+        if (notify_register_dispatch("com.apple.iokit.hid.displayStatus", &_displayToken, dispatch_get_main_queue(), ^(int token) {
+            uint64_t state = 0;
+            if (notify_get_state(token, &state) == NOTIFY_STATUS_OK) weakSelf.displayOn = state != 0;
+            [weakSelf refresh];
+        }) == NOTIFY_STATUS_OK) {
+            uint64_t state = 0;
+            if (notify_get_state(_displayToken, &state) == NOTIFY_STATUS_OK) _displayOn = state != 0;
+        } else _displayToken = -1;
+        if (notify_register_dispatch("com.apple.springboard.lockstate", &_lockToken, dispatch_get_main_queue(), ^(int token) {
+            [weakSelf refresh];
+        }) != NOTIFY_STATUS_OK) _lockToken = -1;
+        if (notify_register_dispatch(CLSaverMirrorNotifyName.UTF8String, &_mirrorToken, dispatch_get_main_queue(), ^(int token) {
+            [weakSelf reloadMirror];
+        }) != NOTIFY_STATUS_OK) _mirrorToken = -1;
+        [self reloadMirror];
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [self.timer invalidate];
+    if (_displayToken >= 0) notify_cancel(_displayToken);
+    if (_lockToken >= 0) notify_cancel(_lockToken);
+    if (_mirrorToken >= 0) notify_cancel(_mirrorToken);
+}
+
+#pragma mark 镜像读取与按钮回显
+
+- (void)reloadMirror {
+    char resolved[PATH_MAX];
+    const char *jb = libroot_dyn_jbrootpath("/var/mobile/ChargeLimiter", resolved);
+    if (!jb) return;
+    NSString *path = [[NSString stringWithUTF8String:jb] stringByAppendingPathComponent:@"saver_state.plist"];
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
+    self.mirror = [dict isKindOfClass:[NSDictionary class]] ? dict : nil;
+    [self resolvePendingEcho];
+    [self refreshCardContent];
+}
+
+// 按钮命令回显闭环：daemon 2s 内经镜像回传即清除 pending；超时判「守护未响应」。
+- (void)resolvePendingEcho {
+    if (self.pendingAction == 0) return;
+    BOOL armed = self.mirror[@"temp_full_charge_active"] ? [self.mirror[@"temp_full_charge_active"] boolValue] : NO;
+    BOOL confirmed = (self.pendingAction == 1 && armed) || (self.pendingAction == 2 && !armed);
+    if (confirmed) {
+        self.pendingAction = 0;
+        return;
+    }
+    if (self.pendingActionTime > 0 &&
+        NSProcessInfo.processInfo.systemUptime - self.pendingActionTime > CLSaverEchoTimeoutSeconds) {
+        self.pendingAction = 0;
+        if (self.card) {
+            self.card.cta.ctaState = 4; // 守护未响应
+            self.hintShownTime = NSProcessInfo.processInfo.systemUptime;
+        }
+        return;
+    }
+}
+
+- (BOOL)saverFeatureEnabled {
+    if (!self.mirror) return NO; // 镜像不存在 = daemon 不在场，回退安全
+    return [self.mirror[@"daemon_enable"] boolValue] && [self.mirror[@"saver_enabled"] boolValue];
+}
+
+#pragma mark 显示门槛（Metis canShow 同款判据 + 充电屏保自有开关）
+
+- (BOOL)canShow {
+    UIView *view = self.host.viewIfLoaded;
+    if (!self.saverFeatureEnabled) return NO;
+    return self.appeared && self.displayOn && !self.passcodeController && view.window && !view.hidden &&
+        view.bounds.size.height > view.bounds.size.width && CLSaverDeviceLocked() &&
+        CLSaverBool(self.host, @"_isMainPageShowing", NO) &&
+        !CLSaverBool(self.host, @"_isPageContentHidden", YES) &&
+        !CLSaverBool(self.host, @"hasContentAboveCoverSheet", YES) &&
+        !CLSaverBool(self.host, @"_isPresentingPosterSwitcher", YES);
+}
+
+#pragma mark 刷新循环（1s tick，0.8s 采样节流，Metis 同款）
+
+- (void)ensureTimer {
+    if (self.timer) return;
+    __weak typeof(self) weakSelf = self;
+    self.timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+        [weakSelf refresh];
+    }];
+    self.timer.tolerance = 0.15;
+    [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)refresh {
+    if (![self canShow]) { [self stop]; return; }
+    if (self.sampling) return;
+    NSTimeInterval probeTime = NSProcessInfo.processInfo.systemUptime;
+    if (probeTime - self.lastProbeTime < 0.8) return;
+    self.lastProbeTime = probeTime;
+    [self sampleBattery];
+}
+
+- (void)sampleBattery {
+    if (!self.saverFeatureEnabled) return;
+    if (self.sampling) return;
+    self.sampling = YES;
+    NSUInteger generation = self.generation;
+    dispatch_async(self.samplingQueue, ^{
+        NSDictionary *battery = CLSaverReadBattery();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.sampling = NO;
+            if (generation != self.generation || ![self canShow]) return;
+            BOOL externalConnected = CLSaverIntValue(battery[@"ExternalConnected"], 0) != 0;
+            BOOL isCharging = CLSaverIntValue(battery[@"IsCharging"], 0) != 0;
+            // 充电屏保只在「已连接外部电源」的充电会话内显示；拔电即收卡
+            if (!externalConnected && !isCharging) { [self stop]; return; }
+            [self ensureTimer];
+            if (!self.card) {
+                self.card = [[CLSaverCardView alloc] initWithFrame:CGRectZero];
+                __weak typeof(self) weakSelf = self;
+                self.card.cta.onTap = ^(NSInteger currentState) {
+                    [weakSelf handleCTATap:currentState];
+                };
+                // 挂到窗口层：深度合成锁屏的壁纸主体层会盖住 cover sheet 内部视图，
+                // 窗口是保证在其之上的最低层（Metis 同款注释与结论）
+                UIView *anchor = self.host.view.window ?: self.host.view;
+                [anchor addSubview:self.card];
+            }
+            [self layout];
+            [self refreshCardContent];
+        });
+    });
+}
+
+- (void)refreshCardContent {
+    if (!self.card) return;
+    self.card.ink.mirror = self.mirror;
+    // 按钮态优先级：守护未响应（停留 3s）> 待回显 > 镜像武装态 > 本地确认倒计时
+    if (self.card.cta.ctaState == 4) {
+        if (NSProcessInfo.processInfo.systemUptime - self.hintShownTime < 3.0) return;
+        self.card.cta.ctaState = 0; // 提示期满，回到正常映射
+    }
+    if (self.pendingAction != 0) {
+        self.card.cta.ctaState = 3;
+        return;
+    }
+    BOOL armed = self.mirror[@"temp_full_charge_active"] ? [self.mirror[@"temp_full_charge_active"] boolValue] : NO;
+    NSInteger localState = self.card.cta.ctaState;
+    if (armed) {
+        self.card.cta.ctaState = 2;
+    } else if (localState == 1) {
+        // 确认倒计时进行中（本地态），保持
+    } else {
+        self.card.cta.ctaState = 0;
+    }
+    [self.card.cta setNeedsDisplay];
+}
+
+#pragma mark 按钮命令（两击确认 + 触感 + notify 下发 + 回显闭环）
+
+- (void)handleCTATap:(NSInteger)state {
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    if (state == 0) {
+        // 未武装 → 确认态（3s 倒计时，超时由 CTA 自身计时还原）
+        self.card.cta.ctaState = 1;
+        self.card.cta.confirmProgress = 1.0;
+        [self startConfirmCountdown];
+        [haptic impactOccurred];
+        [self.card.cta setNeedsDisplay];
+    } else if (state == 1) {
+        // 确认 → 下发启动
+        [self stopConfirmCountdown];
+        UIImpactFeedbackGenerator *heavy = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+        [heavy impactOccurred];
+        [self postSaverAction:1];
+    } else if (state == 2) {
+        // 取消是安全方向：单点直接下发
+        [haptic impactOccurred];
+        [self postSaverAction:2];
+    }
+    // 待回显(3)/提示(4) 态忽略点击
+}
+
+- (void)startConfirmCountdown {
+    [self stopConfirmCountdown];
+    __weak typeof(self) weakSelf = self;
+    NSTimeInterval start = NSProcessInfo.processInfo.systemUptime;
+    NSTimer *countdown = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.card) { [timer invalidate]; return; }
+        if (strongSelf.card.cta.ctaState != 1) { [timer invalidate]; return; }
+        NSTimeInterval elapsed = NSProcessInfo.processInfo.systemUptime - start;
+        strongSelf.card.cta.confirmProgress = 1.0 - elapsed / CLSaverConfirmWindowSeconds;
+        [strongSelf.card.cta setNeedsDisplay];
+        if (elapsed >= CLSaverConfirmWindowSeconds) {
+            [timer invalidate];
+            // 超时还原：镜像里仍未武装才回退（防止与 daemon 回显竞态）
+            BOOL armed = strongSelf.mirror[@"temp_full_charge_active"] ? [strongSelf.mirror[@"temp_full_charge_active"] boolValue] : NO;
+            if (!armed && strongSelf.pendingAction == 0 && strongSelf.card.cta.ctaState == 1) {
+                strongSelf.card.cta.ctaState = 0;
+                [strongSelf.card.cta setNeedsDisplay];
+            }
+        }
+    }];
+    [NSRunLoop.mainRunLoop addTimer:countdown forMode:NSRunLoopCommonModes];
+    objc_setAssociatedObject(self.card.cta, "countdownTimer", countdown, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)stopConfirmCountdown {
+    NSTimer *countdown = objc_getAssociatedObject(self.card.cta, "countdownTimer");
+    [countdown invalidate];
+    objc_setAssociatedObject(self.card.cta, "countdownTimer", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)postSaverAction:(NSInteger)action {
+    static int postToken = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        notify_register_check(CLSaverActionNotifyName.UTF8String, &postToken);
+    });
+    notify_set_state(postToken, (uint64_t)action);
+    notify_post(CLSaverActionNotifyName.UTF8String);
+    self.pendingAction = action;
+    self.pendingActionTime = NSProcessInfo.processInfo.systemUptime;
+    if (self.card) {
+        self.card.cta.ctaState = 3;
+        [self.card.cta setNeedsDisplay];
+    }
+}
+
+#pragma mark 通知栈让位（Metis 有界扫描修剪版）
+
+static BOOL CLSaverNotificationContentClass(NSString *name) {
+    static NSSet<NSString *> *classes;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ classes = [NSSet setWithArray:@[@"NCNotificationListCell",
+        @"NCNotificationShortLookView", @"NCNotificationLongLookView",
+        @"NotificationShortLookView", @"NotificationLongLookView"]]; });
+    return [classes containsObject:name];
+}
+
+static void CLSaverScanNode(UIView *node, NSUInteger depth, NSUInteger *budget, UIView *windowRoot,
+                            UIView **notificationHit) {
+    if (*budget == 0 || depth > 16) return;
+    if (node.hidden || node.alpha < 0.01f) return;
+    (*budget)--;
+    if (!*notificationHit) {
+        for (Class cls = node.class; cls; cls = class_getSuperclass(cls)) {
+            if (CLSaverNotificationContentClass(NSStringFromClass(cls))) {
+                CGRect frame = [node convertRect:node.bounds toView:windowRoot];
+                if (frame.size.width > 8 && frame.size.height > 8 && CGRectIntersectsRect(frame, windowRoot.bounds)) {
+                    *notificationHit = node;
+                }
+                break;
+            }
+        }
+    } else {
+        // 已有命中：保留最靠上的（通知栈顶），卡片让位到栈上方
+        for (Class cls = node.class; cls; cls = class_getSuperclass(cls)) {
+            if (CLSaverNotificationContentClass(NSStringFromClass(cls))) {
+                CGRect frame = [node convertRect:node.bounds toView:windowRoot];
+                if (frame.size.width > 8 && frame.size.height > 8 && CGRectIntersectsRect(frame, windowRoot.bounds)) {
+                    CGRect prev = [*notificationHit convertRect:(*notificationHit).bounds toView:windowRoot];
+                    if (CGRectGetMinY(frame) < CGRectGetMinY(prev)) *notificationHit = node;
+                }
+                break;
+            }
+        }
+    }
+    for (UIView *child in node.subviews) {
+        CLSaverScanNode(child, depth + 1, budget, windowRoot, notificationHit);
+    }
+}
+
+// 返回通知栈在窗口坐标系的顶部 Y（无通知返回 CGFLOAT_MAX）
+static CGFloat CLSaverCoverSheetNotificationTopY(UIViewController *host) {
+    UIView *hostView = host.viewIfLoaded;
+    UIView *window = hostView.window;
+    if (!window) return CGFLOAT_MAX;
+    UIView *hit = nil;
+    NSUInteger budget = 1200;
+    for (UIView *child in window.subviews) {
+        CLSaverScanNode(child, 1, &budget, window, &hit);
+    }
+    if (!hit) return CGFLOAT_MAX;
+    CGRect frame = [hit convertRect:hit.bounds toView:window];
+    return CGRectGetMinY(frame);
+}
+
+#pragma mark 布局（Metis 同款：底部锚点 + 通知栈让位）
+
+- (void)layout {
+    UIView *host = self.host.viewIfLoaded;
+    if (!host || !self.card) return;
+    if (![self canShow]) { [self stop]; return; }
+    CGFloat width = MIN(host.bounds.size.width - 32, 430);
+    CGFloat height = width * CLSaverCardDesignHeight / CLSaverCardDesignWidth;
+    CGFloat bottom = host.bounds.size.height - host.safeAreaInsets.bottom - 86;
+    CGFloat notificationTop = CLSaverCoverSheetNotificationTopY(self.host);
+    if (notificationTop < CGFLOAT_MAX) {
+        // 通知栈在场：卡片上移到栈上方；放不下则隐藏但保持轮询
+        CGFloat movedBottom = notificationTop - 12;
+        if (movedBottom - height >= host.bounds.size.height * 0.35) bottom = movedBottom;
+        else { [self.card removeFromSuperview]; self.card = nil; return; }
+    }
+    if (width < 250 || bottom - height < host.bounds.size.height * 0.35) {
+        [self.card removeFromSuperview];
+        self.card = nil;
+        return;
+    }
+    CGRect rect = CGRectMake((host.bounds.size.width - width) / 2, bottom - height, width, height);
+    UIView *parent = self.card.superview;
+    self.card.frame = parent && parent != host ? [host convertRect:rect toView:parent] : rect;
+    if (parent && parent.subviews.lastObject != self.card) [parent bringSubviewToFront:self.card];
+}
+
+#pragma mark 卡片生命周期
+
+- (void)stop {
+    self.generation++;
+    [self stopConfirmCountdown];
+    [self.timer invalidate];
+    self.timer = nil;
+    [self.card removeFromSuperview];
+    self.card = nil;
+}
+
+#pragma mark 宿主 hook 事件
+
+- (void)hostDidAppear:(UIViewController *)controller {
+    self.host = controller;
+    self.appeared = YES;
+    [self refresh];
+}
+
+- (void)hostWillDisappear:(UIViewController *)controller {
+    if (self.host == controller) {
+        self.appeared = NO;
+        [self stop];
+        self.host = nil;
+    }
+}
+
+- (void)hostDidLayout:(UIViewController *)controller {
+    if (self.host == controller) {
+        [self layout];
+        if (self.saverFeatureEnabled && !self.timer) [self refresh];
+    }
+}
+
+- (void)hostScreenOff:(BOOL)off {
+    self.displayOn = !off;
+    if (self.host) { self.lastProbeTime = 0; [self refresh]; }
+}
+
+- (void)passcodeWillAppear:(UIViewController *)controller {
+    // 密码键盘出现前撤销待发采样，键盘中途摘卡（Metis 同款时序）
+    self.passcodeController = controller;
+    [self stop];
+}
+
+- (void)passcodeDidDisappear:(UIViewController *)controller {
+    if (self.passcodeController == controller) {
+        self.passcodeController = nil;
+        self.lastProbeTime = 0;
+        [self refresh];
+    }
+}
+
+@end
+
+#pragma mark - Hook 安装（Metis MTChargingInstall 同款）
+
+static void (*CLSaverOriginalAppear)(UIViewController *, SEL, BOOL);
+static void (*CLSaverOriginalDisappear)(UIViewController *, SEL, BOOL);
+static void (*CLSaverOriginalLayout)(UIViewController *, SEL);
+static void (*CLSaverOriginalScreenOff)(UIViewController *, SEL, BOOL);
+static void (*CLSaverOriginalContentAbove)(UIViewController *, SEL, BOOL);
+static void (*CLSaverOriginalPageIndex)(UIViewController *, SEL, unsigned long long);
+static void (*CLSaverOriginalPasscodeAppear)(UIViewController *, SEL, BOOL);
+static void (*CLSaverOriginalPasscodeDisappear)(UIViewController *, SEL, BOOL);
+
+static void CLSaverAppear(UIViewController *controller, SEL selector, BOOL animated) {
+    CLSaverOriginalAppear(controller, selector, animated);
+    [CLSaverRuntime.shared hostDidAppear:controller];
+}
+static void CLSaverDisappear(UIViewController *controller, SEL selector, BOOL animated) {
+    [CLSaverRuntime.shared hostWillDisappear:controller];
+    CLSaverOriginalDisappear(controller, selector, animated);
+}
+static void CLSaverLayout(UIViewController *controller, SEL selector) {
+    CLSaverOriginalLayout(controller, selector);
+    [CLSaverRuntime.shared hostDidLayout:controller];
+}
+static void CLSaverScreenOff(UIViewController *controller, SEL selector, BOOL off) {
+    CLSaverOriginalScreenOff(controller, selector, off);
+    [CLSaverRuntime.shared hostScreenOff:off];
+}
+static void CLSaverContentAbove(UIViewController *controller, SEL selector, BOOL above) {
+    CLSaverOriginalContentAbove(controller, selector, above);
+    if (CLSaverRuntime.shared.host == controller) {
+        CLSaverRuntime.shared.lastProbeTime = 0;
+        [CLSaverRuntime.shared refresh];
+    }
+}
+static void CLSaverPageIndex(UIViewController *controller, SEL selector, unsigned long long index) {
+    CLSaverOriginalPageIndex(controller, selector, index);
+    if (CLSaverRuntime.shared.host == controller) {
+        CLSaverRuntime.shared.lastProbeTime = 0;
+        [CLSaverRuntime.shared refresh];
+    }
+}
+static void CLSaverPasscodeAppear(UIViewController *controller, SEL selector, BOOL animated) {
+    [CLSaverRuntime.shared passcodeWillAppear:controller];
+    CLSaverOriginalPasscodeAppear(controller, selector, animated);
+}
+static void CLSaverPasscodeDisappear(UIViewController *controller, SEL selector, BOOL animated) {
+    CLSaverOriginalPasscodeDisappear(controller, selector, animated);
+    [CLSaverRuntime.shared passcodeDidDisappear:controller];
+}
+
+static BOOL CLSaverMethodSupported(Class cls, SEL selector, BOOL animated) {
+    NSMethodSignature *signature = [cls instanceMethodSignatureForSelector:selector];
+    if (!signature || strcmp(signature.methodReturnType, "v") || signature.numberOfArguments != (animated ? 3u : 2u)) return NO;
+    if (!animated) return YES;
+    const char *type = [signature getArgumentTypeAtIndex:2];
+    return !strcmp(type, "B") || !strcmp(type, "c");
+}
+
+static void CLSaverInstall(void) {
+    Class passcode = NSClassFromString(@"CSPasscodeViewController");
+    SEL passcodeAppear = @selector(viewWillAppear:), passcodeDisappear = @selector(viewDidDisappear:);
+    if (CLSaverMethodSupported(passcode, passcodeAppear, YES) &&
+        CLSaverMethodSupported(passcode, passcodeDisappear, YES)) {
+        MSHookMessageEx(passcode, passcodeAppear, (IMP)CLSaverPasscodeAppear, (IMP *)&CLSaverOriginalPasscodeAppear);
+        MSHookMessageEx(passcode, passcodeDisappear, (IMP)CLSaverPasscodeDisappear, (IMP *)&CLSaverOriginalPasscodeDisappear);
+    }
+    Class cls = NSClassFromString(@"CSCoverSheetViewController");
+    SEL appear = @selector(viewDidAppear:), disappear = @selector(viewWillDisappear:), layout = @selector(viewDidLayoutSubviews);
+    if (!CLSaverMethodSupported(cls, appear, YES) || !CLSaverMethodSupported(cls, disappear, YES) ||
+        !CLSaverMethodSupported(cls, layout, NO)) {
+        return; // hook 不可用：功能静默禁用，绝不影响锁屏
+    }
+    MSHookMessageEx(cls, appear, (IMP)CLSaverAppear, (IMP *)&CLSaverOriginalAppear);
+    MSHookMessageEx(cls, disappear, (IMP)CLSaverDisappear, (IMP *)&CLSaverOriginalDisappear);
+    MSHookMessageEx(cls, layout, (IMP)CLSaverLayout, (IMP *)&CLSaverOriginalLayout);
+    SEL screenOff = NSSelectorFromString(@"setInScreenOffMode:");
+    if (CLSaverMethodSupported(cls, screenOff, YES)) {
+        MSHookMessageEx(cls, screenOff, (IMP)CLSaverScreenOff, (IMP *)&CLSaverOriginalScreenOff);
+    }
+    SEL contentAbove = NSSelectorFromString(@"_setHasContentAboveCoverSheet:");
+    if (CLSaverMethodSupported(cls, contentAbove, YES)) {
+        MSHookMessageEx(cls, contentAbove, (IMP)CLSaverContentAbove, (IMP *)&CLSaverOriginalContentAbove);
+    }
+    SEL pageIndex = NSSelectorFromString(@"setLastSettledPageIndex:");
+    NSMethodSignature *pageSignature = [cls instanceMethodSignatureForSelector:pageIndex];
+    if (pageSignature.numberOfArguments == 3 && !strcmp(pageSignature.methodReturnType, "v") &&
+        !strcmp([pageSignature getArgumentTypeAtIndex:2], "Q")) {
+        MSHookMessageEx(cls, pageIndex, (IMP)CLSaverPageIndex, (IMP *)&CLSaverOriginalPageIndex);
+    }
+}
+
+__attribute__((constructor)) static void CLSaverBootstrap(void) {
+    CLSaverInstall();
+}

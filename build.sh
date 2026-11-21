@@ -124,9 +124,12 @@ check_deb() {
         local app_bin="$app/ChargeLimiter"
         local tweak_dylib="$extract_dir/Library/MobileSubstrate/DynamicLibraries/CLThermalSim.dylib"
         local tweak_plist="$extract_dir/Library/MobileSubstrate/DynamicLibraries/CLThermalSim.plist"
+        local saver_dylib="$extract_dir/Library/MobileSubstrate/DynamicLibraries/CLChargingSaver.dylib"
+        local saver_plist="$extract_dir/Library/MobileSubstrate/DynamicLibraries/CLChargingSaver.plist"
         local launchd_plist="$extract_dir/Library/LaunchDaemons/com.chargelimiter.mod.plist"
 
         for path in "$app_bin" "$daemon_bin" "$app/Info.plist" "$tweak_dylib" "$tweak_plist" \
+            "$saver_dylib" "$saver_plist" \
             "$extract_dir/DEBIAN/postinst" "$extract_dir/DEBIAN/prerm" "$extract_dir/DEBIAN/postrm" \
             "$launchd_plist"; do
             if [[ ! -f "$path" ]]; then
@@ -142,7 +145,7 @@ check_deb() {
 
         # 二进制架构：arm64 + arm64e 双切片（RootHide 真机与用户态都需覆盖）
         local bin
-        for bin in "$app_bin" "$daemon_bin" "$tweak_dylib"; do
+        for bin in "$app_bin" "$daemon_bin" "$tweak_dylib" "$saver_dylib"; do
             local archs
             archs="$(lipo -archs "$bin")"
             if [[ " $archs " != *" arm64 "* || " $archs " != *" arm64e "* ]]; then
@@ -169,7 +172,7 @@ check_deb() {
         done
 
         # 链接路径守卫：任何 load command / rpath 残留 /var/jb 都不是合法 roothide 包
-        for bin in "$app_bin" "$daemon_bin" "$tweak_dylib"; do
+        for bin in "$app_bin" "$daemon_bin" "$tweak_dylib" "$saver_dylib"; do
             if otool -L "$bin" 2>/dev/null | grep -F -q "/var/jb"; then
                 echo "error: residual /var/jb load path in $bin" >&2
                 exit 1

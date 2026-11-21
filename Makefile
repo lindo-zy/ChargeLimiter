@@ -20,5 +20,6 @@ include $(THEOS)/makefiles/common.mk
 SUBPROJECTS += ChargeLimiter
 SUBPROJECTS += Daemon
 SUBPROJECTS += Tweak
+SUBPROJECTS += TweakChargingSaver
 
 include $(THEOS_MAKE_PATH)/aggregate.mk

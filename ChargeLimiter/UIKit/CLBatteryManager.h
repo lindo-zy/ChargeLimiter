@@ -152,6 +152,8 @@ extern NSNotificationName const CLDaemonStatusDidChangeNotification;
 @property(nonatomic, assign) NSInteger fullChargeScheduleIntervalDays;
 @property(nonatomic, assign) NSInteger fullChargeScheduleStartMinute;
 @property(nonatomic, assign) NSInteger fullChargeScheduleDurationHours;
+@property(nonatomic, assign) BOOL tempFullChargeOnce;   // 临时充满一次（单发窗口；充满即自动恢复上限）
+@property(nonatomic, assign) BOOL chargingSaverEnabled; // 充电屏保（锁屏策略卡）开关
 
 #pragma mark - 仅限流模式（daemon-free）
 @property(nonatomic, assign, readonly) CLOperationMode operationMode; // 由 enable/limit_only_mode 派生
